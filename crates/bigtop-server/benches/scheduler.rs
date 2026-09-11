@@ -1,7 +1,9 @@
 //! Scheduler throughput benches. Also the callgrind target:
 //! see `profiling/profile-scheduler.sh`.
 
-use bigtop_core::{JobId, NodeId, NodeInfo, Resources, Task, TaskId, TaskSpec, TaskState, VmSpec};
+use bigtop_core::{
+    JobId, NodeId, NodeInfo, Resources, SnapshotPolicy, Task, TaskId, TaskSpec, TaskState, VmSpec,
+};
 use bigtop_server::{tick, StateInner};
 use chrono::Utc;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
@@ -54,7 +56,10 @@ fn synthetic_cluster(node_count: usize, task_count: usize) -> StateInner {
                         vcpu_count: 1,
                         mem_mb: 128,
                         boot_args: None,
+                        boot_snapshot: None,
                     },
+                    node_affinity: None,
+                    snapshot_policy: SnapshotPolicy::None,
                 },
                 state: TaskState::Pending,
                 assigned_node: None,

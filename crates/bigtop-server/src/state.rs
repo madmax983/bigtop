@@ -1,6 +1,10 @@
 //! In-memory store and the mutations the API performs on it.
 
-use bigtop_core::{Error, JobId, JobSpec, NodeId, NodeInfo, Resources, Task, TaskId, TaskState};
+use bigtop_core::{
+    Error, JobId, JobSpec, NodeId, NodeInfo, PendingSnapshot, ReportSnapshotResult,
+    RequestSnapshotRequest, Resources, SnapshotId, SnapshotRecord, SnapshotSpec, SnapshotState,
+    Task, TaskId, TaskState,
+};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -32,6 +36,8 @@ pub struct StateInner {
     pub nodes: HashMap<NodeId, NodeInfo>,
     /// Bounded log tail per task.
     pub logs: HashMap<TaskId, VecDeque<String>>,
+    /// Snapshot requests and their outcomes, by snapshot id.
+    pub snapshots: HashMap<SnapshotId, SnapshotRecord>,
 }
 
 /// Shared handle to the server state.
@@ -187,6 +193,154 @@ pub fn set_task_state(
     Ok(())
 }
 
+/// Request a snapshot of a running task's microVM.
+///
+/// The task must exist, be `Running`, and be assigned to a node; the record
+/// starts in [`SnapshotState::Requested`] for the owning agent to pick up.
+///
+/// # Errors
+///
+/// Returns [`Error::NotFound`] for an unknown task, or [`Error::Conflict`]
+/// when the task is not in a snapshottable state.
+pub fn request_snapshot(
+    inner: &mut StateInner,
+    task_id: &TaskId,
+    req: &RequestSnapshotRequest,
+    now: DateTime<Utc>,
+) -> Result<SnapshotId, Error> {
+    let task = inner
+        .tasks
+        .get(task_id)
+        .ok_or_else(|| Error::NotFound(format!("task {task_id}")))?;
+    if task.state != TaskState::Running {
+        return Err(Error::Conflict(format!(
+            "task {task_id} is {} (must be running to snapshot)",
+            task.state
+        )));
+    }
+    let node_id = task.assigned_node.clone().ok_or_else(|| {
+        Error::Conflict(format!("task {task_id} is running but assigned to no node"))
+    })?;
+    let id = SnapshotId::generate();
+    inner.snapshots.insert(
+        id.clone(),
+        SnapshotRecord {
+            id: id.clone(),
+            task_id: task_id.clone(),
+            node_id,
+            spec: SnapshotSpec {
+                snapshot_type: req.snapshot_type,
+                mem_file_path: req.mem_file_path.clone().unwrap_or_default(),
+                snapshot_path: req.snapshot_path.clone().unwrap_or_default(),
+            },
+            state: SnapshotState::Requested,
+            error: None,
+            created_at: now,
+        },
+    );
+    Ok(id)
+}
+
+/// Snapshot requests waiting for `node_id`'s agent, oldest first.
+#[must_use]
+pub fn snapshot_requests_for_node(inner: &StateInner, node_id: &NodeId) -> Vec<PendingSnapshot> {
+    let mut out: Vec<PendingSnapshot> = inner
+        .snapshots
+        .values()
+        .filter(|r| r.state == SnapshotState::Requested && r.node_id == *node_id)
+        .map(|r| PendingSnapshot {
+            snapshot_id: r.id.clone(),
+            task_id: r.task_id.clone(),
+            spec: r.spec.clone(),
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        inner.snapshots[&a.snapshot_id]
+            .created_at
+            .cmp(&inner.snapshots[&b.snapshot_id].created_at)
+    });
+    out
+}
+
+/// All snapshot records for a task, oldest first.
+///
+/// # Errors
+///
+/// Returns [`Error::NotFound`] for an unknown task.
+pub fn task_snapshots(inner: &StateInner, task_id: &TaskId) -> Result<Vec<SnapshotRecord>, Error> {
+    if !inner.tasks.contains_key(task_id) {
+        return Err(Error::NotFound(format!("task {task_id}")));
+    }
+    let mut out: Vec<SnapshotRecord> = inner
+        .snapshots
+        .values()
+        .filter(|r| r.task_id == *task_id)
+        .cloned()
+        .collect();
+    out.sort_by_key(|r| r.created_at);
+    Ok(out)
+}
+
+/// Record the agent's progress report for a snapshot.
+///
+/// Allowed transitions: `Requested -> {InProgress, Done, Failed}` and
+/// `InProgress -> {Done, Failed}`. On `Done`, resolved file paths from the
+/// report replace the requested ones.
+///
+/// # Errors
+///
+/// Returns [`Error::NotFound`] for an unknown snapshot (or a snapshot that
+/// does not belong to `task_id`), or [`Error::Conflict`] for an illegal
+/// state transition or a terminal `state` report that is not `Done`/`Failed`
+/// (reports must be `InProgress`, `Done`, or `Failed`).
+pub fn report_snapshot_result(
+    inner: &mut StateInner,
+    task_id: &TaskId,
+    snapshot_id: &SnapshotId,
+    result: &ReportSnapshotResult,
+) -> Result<(), Error> {
+    if matches!(result.state, SnapshotState::Requested) {
+        return Err(Error::Conflict(format!(
+            "snapshot {snapshot_id}: agents cannot report Requested"
+        )));
+    }
+    let record = inner
+        .snapshots
+        .get_mut(snapshot_id)
+        .ok_or_else(|| Error::NotFound(format!("snapshot {snapshot_id} for task {task_id}")))?;
+    if record.task_id != *task_id {
+        return Err(Error::NotFound(format!(
+            "snapshot {snapshot_id} does not belong to task {task_id}"
+        )));
+    }
+    let legal = matches!(
+        (&record.state, result.state),
+        (
+            SnapshotState::Requested,
+            SnapshotState::InProgress | SnapshotState::Done | SnapshotState::Failed
+        ) | (
+            SnapshotState::InProgress,
+            SnapshotState::Done | SnapshotState::Failed
+        )
+    );
+    if !legal {
+        return Err(Error::Conflict(format!(
+            "snapshot {snapshot_id}: cannot move from {:?} to {:?}",
+            record.state, result.state
+        )));
+    }
+    record.state = result.state;
+    record.node_id = result.node_id.clone();
+    record.error.clone_from(&result.error);
+    if let Some(path) = &result.mem_file_path {
+        record.spec.mem_file_path.clone_from(path);
+    }
+    if let Some(path) = &result.snapshot_path {
+        record.spec.snapshot_path.clone_from(path);
+    }
+    Ok(())
+}
+
 /// Append log lines, keeping only the bounded tail.
 ///
 /// # Errors
@@ -207,7 +361,7 @@ pub fn push_logs(inner: &mut StateInner, id: &TaskId, lines: &[String]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bigtop_core::{TaskSpec, VmSpec};
+    use bigtop_core::{SnapshotPolicy, SnapshotType, TaskSpec, VmSpec};
     use std::collections::HashMap;
 
     fn job_spec(count: u32) -> JobSpec {
@@ -226,7 +380,10 @@ mod tests {
                     vcpu_count: 1,
                     mem_mb: 128,
                     boot_args: None,
+                    boot_snapshot: None,
                 },
+                node_affinity: None,
+                snapshot_policy: SnapshotPolicy::None,
             }],
         }
     }
@@ -296,5 +453,176 @@ mod tests {
         let mut inner = StateInner::default();
         let err = heartbeat(&mut inner, &NodeId::generate(), Utc::now()).expect_err("not found");
         assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    fn running_task(inner: &mut StateInner) -> (TaskId, NodeId) {
+        create_job(inner, &job_spec(1), Utc::now()).expect("create");
+        let id = inner.tasks.keys().next().expect("task").clone();
+        let node = NodeId::from("node-1".to_string());
+        let task = inner.tasks.get_mut(&id).expect("task");
+        task.state = TaskState::Running;
+        task.assigned_node = Some(node.clone());
+        (id, node)
+    }
+
+    fn snapshot_req() -> RequestSnapshotRequest {
+        RequestSnapshotRequest {
+            snapshot_type: SnapshotType::Full,
+            mem_file_path: None,
+            snapshot_path: None,
+        }
+    }
+
+    fn snapshot_result(state: SnapshotState, node: &NodeId) -> ReportSnapshotResult {
+        ReportSnapshotResult {
+            state,
+            node_id: node.clone(),
+            mem_file_path: Some("/vms/x.mem".to_string()),
+            snapshot_path: Some("/vms/x.snap".to_string()),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_request_needs_running_task() {
+        let mut inner = StateInner::default();
+        create_job(&mut inner, &job_spec(1), Utc::now()).expect("create");
+        let id = inner.tasks.keys().next().expect("task").clone();
+        // Pending: not snapshottable.
+        let err = request_snapshot(&mut inner, &id, &snapshot_req(), Utc::now())
+            .expect_err("must reject pending task");
+        assert!(matches!(err, Error::Conflict(_)));
+        // Unknown task.
+        let err = request_snapshot(&mut inner, &TaskId::generate(), &snapshot_req(), Utc::now())
+            .expect_err("must reject unknown task");
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[test]
+    fn snapshot_lifecycle_requested_to_done() {
+        let mut inner = StateInner::default();
+        let (task_id, node) = running_task(&mut inner);
+        let snap_id =
+            request_snapshot(&mut inner, &task_id, &snapshot_req(), Utc::now()).expect("request");
+        let record = inner.snapshots.get(&snap_id).expect("record");
+        assert_eq!(record.state, SnapshotState::Requested);
+        assert_eq!(record.node_id, node);
+        assert_eq!(record.task_id, task_id);
+
+        // The owning node sees it in its queue; other nodes do not.
+        let queue = snapshot_requests_for_node(&inner, &node);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].snapshot_id, snap_id);
+        let other = snapshot_requests_for_node(&inner, &NodeId::from("node-2".to_string()));
+        assert!(other.is_empty());
+
+        // InProgress then Done with resolved paths.
+        report_snapshot_result(
+            &mut inner,
+            &task_id,
+            &snap_id,
+            &snapshot_result(SnapshotState::InProgress, &node),
+        )
+        .expect("in progress");
+        report_snapshot_result(
+            &mut inner,
+            &task_id,
+            &snap_id,
+            &snapshot_result(SnapshotState::Done, &node),
+        )
+        .expect("done");
+        let record = inner.snapshots.get(&snap_id).expect("record");
+        assert_eq!(record.state, SnapshotState::Done);
+        assert_eq!(record.spec.mem_file_path, "/vms/x.mem");
+        // Done leaves the agent queue.
+        assert!(snapshot_requests_for_node(&inner, &node).is_empty());
+        // And shows up in the task's snapshot list.
+        let list = task_snapshots(&inner, &task_id).expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, snap_id);
+    }
+
+    #[test]
+    fn snapshot_rejects_illegal_transitions() {
+        let mut inner = StateInner::default();
+        let (task_id, node) = running_task(&mut inner);
+        let snap_id =
+            request_snapshot(&mut inner, &task_id, &snapshot_req(), Utc::now()).expect("request");
+
+        // Agents cannot report Requested.
+        let err = report_snapshot_result(
+            &mut inner,
+            &task_id,
+            &snap_id,
+            &snapshot_result(SnapshotState::Requested, &node),
+        )
+        .expect_err("requested report");
+        assert!(matches!(err, Error::Conflict(_)));
+
+        // Requested -> Done directly is fine; Done -> Failed is not.
+        report_snapshot_result(
+            &mut inner,
+            &task_id,
+            &snap_id,
+            &snapshot_result(SnapshotState::Done, &node),
+        )
+        .expect("done");
+        let err = report_snapshot_result(
+            &mut inner,
+            &task_id,
+            &snap_id,
+            &ReportSnapshotResult {
+                state: SnapshotState::Failed,
+                node_id: node.clone(),
+                mem_file_path: None,
+                snapshot_path: None,
+                error: Some("boom".to_string()),
+            },
+        )
+        .expect_err("terminal transition");
+        assert!(matches!(err, Error::Conflict(_)));
+
+        // Unknown snapshot and wrong task.
+        let err = report_snapshot_result(
+            &mut inner,
+            &task_id,
+            &SnapshotId::generate(),
+            &snapshot_result(SnapshotState::Done, &node),
+        )
+        .expect_err("unknown snapshot");
+        assert!(matches!(err, Error::NotFound(_)));
+        let err = report_snapshot_result(
+            &mut inner,
+            &TaskId::generate(),
+            &snap_id,
+            &snapshot_result(SnapshotState::Done, &node),
+        )
+        .expect_err("wrong task");
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[test]
+    fn snapshot_failure_records_error() {
+        let mut inner = StateInner::default();
+        let (task_id, node) = running_task(&mut inner);
+        let snap_id =
+            request_snapshot(&mut inner, &task_id, &snapshot_req(), Utc::now()).expect("request");
+        report_snapshot_result(
+            &mut inner,
+            &task_id,
+            &snap_id,
+            &ReportSnapshotResult {
+                state: SnapshotState::Failed,
+                node_id: node,
+                mem_file_path: None,
+                snapshot_path: None,
+                error: Some("firecracker refused".to_string()),
+            },
+        )
+        .expect("failed");
+        let record = inner.snapshots.get(&snap_id).expect("record");
+        assert_eq!(record.state, SnapshotState::Failed);
+        assert!(record.state.is_terminal());
+        assert_eq!(record.error.as_deref(), Some("firecracker refused"));
     }
 }

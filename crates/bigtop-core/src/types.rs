@@ -1,6 +1,7 @@
 //! Domain types: resources, VM specs, task specs, tasks, and nodes.
 
 use crate::ids::{JobId, NodeId, TaskId};
+use crate::snapshots::{SnapshotLoadSpec, SnapshotPolicy};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -63,11 +64,16 @@ pub struct VmSpec {
     /// Extra kernel boot args. `BigTop` appends its own task parameters.
     #[serde(default)]
     pub boot_args: Option<String>,
+    /// Boot the microVM from a snapshot instead of kernel + rootfs.
+    /// When set, the Firecracker `PUT /snapshot/load` path replaces the
+    /// machine-config / boot-source / drive configuration.
+    #[serde(default)]
+    pub boot_snapshot: Option<SnapshotLoadSpec>,
 }
 
 impl Default for VmSpec {
     /// Sensible defaults: empty image paths (must be set before use),
-    /// 1 vCPU, 128 MiB, no extra boot args.
+    /// 1 vCPU, 128 MiB, no extra boot args, fresh boot.
     fn default() -> Self {
         Self {
             kernel_image: String::new(),
@@ -75,6 +81,7 @@ impl Default for VmSpec {
             vcpu_count: default_vcpu_count(),
             mem_mb: default_vm_mem_mb(),
             boot_args: None,
+            boot_snapshot: None,
         }
     }
 }
@@ -109,6 +116,13 @@ pub struct TaskSpec {
     /// The microVM to boot for each task.
     #[serde(default)]
     pub vm: VmSpec,
+    /// Pin this task to a specific node. Used by snapshot restore so the
+    /// new task lands where the snapshot files live.
+    #[serde(default)]
+    pub node_affinity: Option<NodeId>,
+    /// Automatic microVM snapshotting. Only applies to microVM tasks.
+    #[serde(default)]
+    pub snapshot_policy: SnapshotPolicy,
 }
 
 const fn default_count() -> u32 {
@@ -323,7 +337,10 @@ mod tests {
                     vcpu_count: 1,
                     mem_mb: 128,
                     boot_args: None,
+                    boot_snapshot: None,
                 },
+                node_affinity: None,
+                snapshot_policy: SnapshotPolicy::None,
             },
             state: TaskState::Pending,
             assigned_node: None,

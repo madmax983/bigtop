@@ -2,7 +2,8 @@
 //!
 //! These are the JSON shapes the server, agent, and CLI agree on.
 
-use crate::ids::{JobId, NodeId};
+use crate::ids::{JobId, NodeId, SnapshotId, TaskId};
+use crate::snapshots::{SnapshotSpec, SnapshotState, SnapshotType};
 use crate::types::Resources;
 use crate::types::TaskState;
 use chrono::{DateTime, Utc};
@@ -67,4 +68,56 @@ pub struct JobSummary {
 pub struct SubmitJobResponse {
     /// The new job id.
     pub job_id: JobId,
+}
+
+/// `POST /v1/tasks/{id}/snapshot` body: ask the owning agent to snapshot a
+/// running microVM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestSnapshotRequest {
+    /// Full or incremental snapshot. Defaults to `Full`.
+    #[serde(default)]
+    pub snapshot_type: SnapshotType,
+    /// Destination for the guest memory file. `None` = agent default.
+    #[serde(default)]
+    pub mem_file_path: Option<String>,
+    /// Destination for the snapshot state file. `None` = agent default.
+    #[serde(default)]
+    pub snapshot_path: Option<String>,
+}
+
+/// `POST /v1/tasks/{id}/snapshot` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestSnapshotResponse {
+    /// The new snapshot request id.
+    pub snapshot_id: SnapshotId,
+}
+
+/// `GET /v1/agents/snapshot-requests` row: a snapshot the agent should take.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingSnapshot {
+    /// Snapshot request id.
+    pub snapshot_id: SnapshotId,
+    /// Task whose microVM to snapshot.
+    pub task_id: TaskId,
+    /// Requested parameters; empty paths mean "use the agent default".
+    pub spec: SnapshotSpec,
+}
+
+/// `POST /v1/tasks/{id}/snapshots/{snapshot_id}/result` body: the agent
+/// reports progress or the final outcome of a snapshot request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportSnapshotResult {
+    /// New state: `InProgress`, `Done`, or `Failed`.
+    pub state: SnapshotState,
+    /// Node that performed the snapshot.
+    pub node_id: NodeId,
+    /// Resolved guest memory file path (set on `Done`).
+    #[serde(default)]
+    pub mem_file_path: Option<String>,
+    /// Resolved snapshot state file path (set on `Done`).
+    #[serde(default)]
+    pub snapshot_path: Option<String>,
+    /// Failure detail (set on `Failed`).
+    #[serde(default)]
+    pub error: Option<String>,
 }

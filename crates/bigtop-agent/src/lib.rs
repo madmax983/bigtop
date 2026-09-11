@@ -6,17 +6,30 @@
 //! when `/dev/kvm` exists, else processes).
 
 mod firecracker;
+mod jailer;
 mod runtime;
+mod snapshot;
+mod vsock;
 
 pub use firecracker::{FirecrackerConfig, FirecrackerRuntime};
+pub use jailer::{JailerConfig, JailerOptions, JAILED_API_SOCK, JAILED_LOG_PATH};
 pub use runtime::{ProcessRuntime, RunningTask, Runtime};
+pub use snapshot::{
+    resolve_snapshot_paths, snapshot_create_body, snapshot_load_body, SnapshotManager,
+};
+pub use vsock::{LogFrame, LogStream, VsockLogHub, VSOCK_HOST_CID, VSOCK_LOG_PORT};
 
 use bigtop_core::{
-    api::{PushLogsRequest, RegisterNodeRequest, RegisterNodeResponse, SetTaskStateRequest},
-    NodeId, Resources, Task, TaskId, TaskState,
+    api::{
+        PendingSnapshot, PushLogsRequest, RegisterNodeRequest, RegisterNodeResponse,
+        ReportSnapshotResult, RequestSnapshotRequest, RequestSnapshotResponse, SetTaskStateRequest,
+    },
+    NodeId, Resources, SnapshotId, SnapshotPolicy, SnapshotSpec, SnapshotState, Task, TaskId,
+    TaskState,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 
@@ -105,19 +118,77 @@ pub enum AgentError {
     Server(String),
 }
 
+/// Snapshot ids this agent already handles: the poll loop skips them so one
+/// snapshot request is never taken twice (e.g. an `OnSuccess` watcher and
+/// the poll loop racing on the same record).
+type SnapshotClaims = Arc<std::sync::Mutex<HashSet<SnapshotId>>>;
+
 /// Run the agent forever: register, heartbeat, and execute assigned tasks.
+///
+/// With the Firecracker runtime, fresh boots get a virtio-vsock device and
+/// the agent serves each task's guest log connections into a shared hub
+/// (see `vsock`); otherwise guests log over the serial console. Snapshot
+/// requests are picked up alongside task assignments.
 ///
 /// # Errors
 ///
-/// Returns [`AgentError`] if registration fails.
+/// Returns [`AgentError`] if registration keeps failing.
 pub async fn run_agent(config: AgentConfig, runtime: RuntimeKind) -> Result<(), AgentError> {
     let client = reqwest::Client::new();
-    let node_id = register(&client, &config).await?;
+    let node_id = register_with_retry(&client, &config).await?;
+    // Snapshot ids this agent already handles (dispatched from the poll
+    // loop or created by an OnSuccess watcher): the poll loop skips them
+    // so one request is never snapshotted twice.
+    let snapshots_seen: SnapshotClaims = Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let hub = if matches!(runtime, RuntimeKind::Firecracker(_)) {
+        Some(VsockLogHub::new())
+    } else {
+        None
+    };
+    let runtime = match runtime {
+        RuntimeKind::Firecracker(fc) => {
+            let fc = match &hub {
+                Some(hub) => fc.with_vsock_hub(hub.clone()),
+                None => fc,
+            };
+            RuntimeKind::Firecracker(fc)
+        }
+        RuntimeKind::Process(p) => RuntimeKind::Process(p),
+    };
     tokio::join!(
         heartbeat_loop(&client, &config, &node_id),
-        poll_loop(&client, &config, &node_id, runtime),
+        poll_loop(
+            &client,
+            &config,
+            &node_id,
+            runtime,
+            hub,
+            snapshots_seen.clone()
+        ),
     );
     Ok(())
+}
+
+/// Register, retrying while the server is still coming up (or restarting).
+/// Tries for ~30 s with a 500 ms backoff before giving up and returning the
+/// last error.
+async fn register_with_retry(
+    client: &reqwest::Client,
+    config: &AgentConfig,
+) -> Result<NodeId, AgentError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match register(client, config).await {
+            Ok(id) => return Ok(id),
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
+                eprintln!("bigtop agent: registration failed ({e}); retrying...");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
 }
 
 /// Register this agent as a node. Returns the assigned node id.
@@ -151,11 +222,14 @@ async fn heartbeat_loop(client: &reqwest::Client, config: &AgentConfig, node_id:
 }
 
 /// Poll for assignments; spawn a supervisor per new task.
+/// Also polls for snapshot requests and dispatches them.
 async fn poll_loop(
     client: &reqwest::Client,
     config: &AgentConfig,
     node_id: &NodeId,
     runtime: RuntimeKind,
+    hub: Option<VsockLogHub>,
+    snapshots_seen: SnapshotClaims,
 ) {
     let mut running: HashMap<TaskId, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut ticker = tokio::time::interval(config.poll_interval);
@@ -172,43 +246,106 @@ async fn poll_loop(
                     let handle = tokio::spawn(execute_task(
                         client.clone(),
                         config.clone(),
+                        node_id.clone(),
                         runtime.clone(),
                         task,
+                        hub.clone(),
+                        snapshots_seen.clone(),
                     ));
                     running.insert(task_id, handle);
                 }
             }
             Err(e) => eprintln!("bigtop agent: assignment poll failed: {e}"),
         }
+        match fetch_snapshot_requests(client, config, node_id).await {
+            Ok(requests) => {
+                for request in requests {
+                    // The set doubles as the dedup guard: `insert` is false
+                    // when this agent already handles the request.
+                    let fresh = snapshots_seen
+                        .lock()
+                        .is_ok_and(|mut seen| seen.insert(request.snapshot_id.clone()));
+                    if !fresh {
+                        continue;
+                    }
+                    tokio::spawn(handle_snapshot_request(
+                        client.clone(),
+                        config.clone(),
+                        node_id.clone(),
+                        runtime.clone(),
+                        request,
+                    ));
+                }
+            }
+            Err(e) => eprintln!("bigtop agent: snapshot poll failed: {e}"),
+        }
     }
 }
 
 /// Spawn one task, report `Running`, stream logs, report the terminal state.
+/// When the task carries an `OnSuccess` snapshot policy and the vsock hub
+/// is active, a watcher snapshots the microVM as soon as the guest signals
+/// completion (best-effort: the guest may power off first).
 async fn execute_task(
     client: reqwest::Client,
     config: AgentConfig,
+    node_id: NodeId,
     runtime: RuntimeKind,
     task: Task,
+    hub: Option<VsockLogHub>,
+    snapshots_seen: SnapshotClaims,
 ) {
+    // Register the vsock log channel before the VMM boots, so a fast guest
+    // cannot dial in before its channel exists.
+    let vsock_rx = match &hub {
+        Some(hub) => {
+            let (vtx, vrx) = tokio::sync::mpsc::channel::<String>(512);
+            hub.register(task.id.clone(), vtx).await;
+            Some(vrx)
+        }
+        None => None,
+    };
+    let snapshot_watch = match (&runtime, &task.spec.snapshot_policy, &hub) {
+        (RuntimeKind::Firecracker(fc), SnapshotPolicy::OnSuccess(spec), Some(hub)) => {
+            Some(tokio::spawn(snapshot_on_success(OnSuccessWatch {
+                client: client.clone(),
+                config: config.clone(),
+                node_id,
+                fc: fc.clone(),
+                task_id: task.id.clone(),
+                spec: spec.clone(),
+                hub: hub.clone(),
+                snapshots_seen,
+            })))
+        }
+        _ => None,
+    };
     match runtime.spawn(&task).await {
         Ok(running) => {
             let task_id = running.task_id.clone();
+            // Stops the task's vsock listener once the task is done; the
+            // listener task removes its own socket file on exit.
+            let vsock_stop = running.vsock_stop;
             report_state(&client, &config, &task_id, TaskState::Running, None).await;
-            let (state, code) = match supervise(&client, &config, &task_id, running.child).await {
-                Ok(status) => (
-                    if status.success() {
-                        TaskState::Succeeded
-                    } else {
-                        TaskState::Failed
-                    },
-                    status.code(),
-                ),
-                Err(e) => {
-                    eprintln!("bigtop agent: task {task_id} wait failed: {e}");
-                    (TaskState::Failed, None)
-                }
-            };
+            let (state, code) =
+                match supervise(&client, &config, &task_id, running.child, vsock_rx).await {
+                    Ok(status) => (
+                        if status.success() {
+                            TaskState::Succeeded
+                        } else {
+                            TaskState::Failed
+                        },
+                        status.code(),
+                    ),
+                    Err(e) => {
+                        eprintln!("bigtop agent: task {task_id} wait failed: {e}");
+                        (TaskState::Failed, None)
+                    }
+                };
             report_state(&client, &config, &task_id, state, code).await;
+            if let Some(stop) = vsock_stop {
+                let _ = stop.send(());
+            }
         }
         Err(e) => {
             let task_id = task.id.clone();
@@ -223,16 +360,191 @@ async fn execute_task(
             report_state(&client, &config, &task_id, TaskState::Failed, None).await;
         }
     }
+    if let Some(handle) = snapshot_watch {
+        handle.abort();
+    }
+    if let Some(hub) = &hub {
+        hub.unregister(&task.id).await;
+    }
 }
 
-/// Stream the child's stdout/stderr to the server, then wait for exit.
+/// Inputs for the on-success snapshot watcher (bundled: clippy caps
+/// function arity at seven).
+struct OnSuccessWatch {
+    client: reqwest::Client,
+    config: AgentConfig,
+    node_id: NodeId,
+    fc: FirecrackerRuntime,
+    task_id: TaskId,
+    spec: SnapshotSpec,
+    hub: VsockLogHub,
+    snapshots_seen: SnapshotClaims,
+}
+
+/// Wait for the guest's completion signal, then snapshot the microVM.
+///
+/// Creates the server snapshot record first (via the same endpoint the
+/// CLI uses), reports `InProgress`, snapshots, and reports the outcome.
+/// The completion frame arrives while the VMM is still alive, so the
+/// snapshot races the guest's power-off. If the VM is already gone the
+/// snapshot fails and is reported as `Failed`; the task's own terminal
+/// state is unaffected.
+async fn snapshot_on_success(watch: OnSuccessWatch) {
+    let OnSuccessWatch {
+        client,
+        config,
+        node_id,
+        fc,
+        task_id,
+        spec,
+        hub,
+        snapshots_seen,
+    } = watch;
+    let done = hub.subscribe_completion(&task_id).await;
+    if done.await.is_err() {
+        return;
+    }
+    let snapshot_id = match request_snapshot_record(&client, &config, &task_id, &spec).await {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("bigtop agent: on-success snapshot request failed for {task_id}: {e}");
+            return;
+        }
+    };
+    // Claim the id before the next poll tick sees the new record: no await
+    // between here and the insert, so the poll loop cannot interleave.
+    if let Ok(mut seen) = snapshots_seen.lock() {
+        seen.insert(snapshot_id.clone());
+    }
+    eprintln!("bigtop agent: guest {task_id} completed; taking on-success snapshot");
+    report_snapshot_result(
+        &client,
+        &config,
+        &task_id,
+        &snapshot_id,
+        &ReportSnapshotResult {
+            state: SnapshotState::InProgress,
+            node_id: node_id.clone(),
+            mem_file_path: None,
+            snapshot_path: None,
+            error: None,
+        },
+    )
+    .await;
+    let result = fc.take_snapshot(&task_id, &snapshot_id, &spec).await;
+    let report = match result {
+        Ok((mem, snap)) => ReportSnapshotResult {
+            state: SnapshotState::Done,
+            node_id,
+            mem_file_path: Some(mem.to_string_lossy().into_owned()),
+            snapshot_path: Some(snap.to_string_lossy().into_owned()),
+            error: None,
+        },
+        Err(e) => {
+            eprintln!("bigtop agent: on-success snapshot failed for {task_id}: {e}");
+            ReportSnapshotResult {
+                state: SnapshotState::Failed,
+                node_id,
+                mem_file_path: None,
+                snapshot_path: None,
+                error: Some(e.to_string()),
+            }
+        }
+    };
+    report_snapshot_result(&client, &config, &task_id, &snapshot_id, &report).await;
+}
+
+/// Handle one server snapshot request: report `InProgress`, snapshot the
+/// running microVM, report the outcome. Reports `Failed` immediately when
+/// the agent is not running the Firecracker runtime.
+async fn handle_snapshot_request(
+    client: reqwest::Client,
+    config: AgentConfig,
+    node_id: NodeId,
+    runtime: RuntimeKind,
+    request: PendingSnapshot,
+) {
+    let task_id = request.task_id.clone();
+    let snapshot_id = request.snapshot_id.clone();
+    let RuntimeKind::Firecracker(fc) = runtime else {
+        report_snapshot_result(
+            &client,
+            &config,
+            &task_id,
+            &snapshot_id,
+            &ReportSnapshotResult {
+                state: SnapshotState::Failed,
+                node_id,
+                mem_file_path: None,
+                snapshot_path: None,
+                error: Some("snapshot needs the firecracker runtime".to_string()),
+            },
+        )
+        .await;
+        return;
+    };
+    report_snapshot_result(
+        &client,
+        &config,
+        &task_id,
+        &snapshot_id,
+        &ReportSnapshotResult {
+            state: SnapshotState::InProgress,
+            node_id: node_id.clone(),
+            mem_file_path: None,
+            snapshot_path: None,
+            error: None,
+        },
+    )
+    .await;
+    let result = fc
+        .take_snapshot(&task_id, &snapshot_id, &request.spec)
+        .await;
+    let final_report = match result {
+        Ok((mem, snap)) => ReportSnapshotResult {
+            state: SnapshotState::Done,
+            node_id,
+            mem_file_path: Some(mem.to_string_lossy().into_owned()),
+            snapshot_path: Some(snap.to_string_lossy().into_owned()),
+            error: None,
+        },
+        Err(e) => {
+            eprintln!("bigtop agent: snapshot {snapshot_id} failed for {task_id}: {e}");
+            ReportSnapshotResult {
+                state: SnapshotState::Failed,
+                node_id,
+                mem_file_path: None,
+                snapshot_path: None,
+                error: Some(e.to_string()),
+            }
+        }
+    };
+    report_snapshot_result(&client, &config, &task_id, &snapshot_id, &final_report).await;
+}
+
+/// Stream the child's stdout/stderr (plus vsock lines, when `vsock_rx` is
+/// `Some`) to the server, then wait for exit.
 async fn supervise(
     client: &reqwest::Client,
     config: &AgentConfig,
     task_id: &TaskId,
     mut child: tokio::process::Child,
+    vsock_rx: Option<tokio::sync::mpsc::Receiver<String>>,
 ) -> std::io::Result<std::process::ExitStatus> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(512);
+    // Vsock lines ride a forwarder into the same channel, so ordering with
+    // serial-console lines is by arrival. The forwarder exits on its own
+    // when `tx` drops.
+    if let Some(mut vrx) = vsock_rx {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some(line) = vrx.recv().await {
+                if tx.send(line).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
     if let Some(pipe) = child.stdout.take() {
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -339,6 +651,59 @@ async fn fetch_assignments(
     Ok(response.json::<Vec<Task>>().await?)
 }
 
+/// Fetch snapshot requests waiting for this node.
+async fn fetch_snapshot_requests(
+    client: &reqwest::Client,
+    config: &AgentConfig,
+    node_id: &NodeId,
+) -> Result<Vec<PendingSnapshot>, AgentError> {
+    let url = format!(
+        "{}/v1/agents/snapshot-requests?node_id={node_id}",
+        config.server_url
+    );
+    let response = client.get(&url).send().await?;
+    let response = check_ok(response).await?;
+    Ok(response.json::<Vec<PendingSnapshot>>().await?)
+}
+
+/// Ask the server to record a snapshot request; returns the new id.
+/// Used for `OnSuccess` snapshots so they show up in `snapshot list` and
+/// can be restored like CLI-requested ones.
+async fn request_snapshot_record(
+    client: &reqwest::Client,
+    config: &AgentConfig,
+    task_id: &TaskId,
+    spec: &SnapshotSpec,
+) -> Result<SnapshotId, AgentError> {
+    let request = RequestSnapshotRequest {
+        snapshot_type: spec.snapshot_type,
+        mem_file_path: (!spec.mem_file_path.is_empty()).then(|| spec.mem_file_path.clone()),
+        snapshot_path: (!spec.snapshot_path.is_empty()).then(|| spec.snapshot_path.clone()),
+    };
+    let url = format!("{}/v1/tasks/{task_id}/snapshot", config.server_url);
+    let response = post_json(client, &url, &request).await?;
+    Ok(response
+        .json::<RequestSnapshotResponse>()
+        .await?
+        .snapshot_id)
+}
+
+/// Report a snapshot outcome to the server; log locally on failure.
+async fn report_snapshot_result(
+    client: &reqwest::Client,
+    config: &AgentConfig,
+    task_id: &TaskId,
+    snapshot_id: &SnapshotId,
+    result: &ReportSnapshotResult,
+) {
+    let url = format!(
+        "{}/v1/tasks/{task_id}/snapshots/{snapshot_id}/result",
+        config.server_url
+    );
+    if let Err(e) = post_json(client, &url, result).await {
+        eprintln!("bigtop agent: snapshot report failed for {snapshot_id}: {e}");
+    }
+}
 /// `POST` JSON, mapping error statuses to [`AgentError::Server`].
 async fn post_json(
     client: &reqwest::Client,

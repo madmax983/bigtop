@@ -1,29 +1,42 @@
 //! `FirecrackerRuntime`: one microVM per task.
 //!
 //! This talks to the real Firecracker `REST` API over a Unix socket:
-//! `PUT /machine-config`, `PUT /boot-source`, `PUT /drives/rootfs`, then
-//! `PUT /actions` with `InstanceStart`. The guest's serial console arrives
-//! on the `firecracker` process's stdout and is streamed as task logs.
+//! fresh boots do `PUT /machine-config`, `PUT /boot-source`,
+//! `PUT /drives/rootfs`, `PUT /vsock`, then `PUT /actions` with
+//! `InstanceStart`; snapshot boots do `PUT /snapshot/load` with
+//! `resume_vm`.
+//!
+//! The guest's serial console arrives on the `firecracker` process's stdout
+//! and is streamed as task logs. Fresh boots also get a virtio-vsock
+//! device: the guest dials `(CID 2, 4668)` over `AF_VSOCK` and Firecracker
+//! bridges it into the agent's per-task `AF_UNIX` listener, which feeds
+//! the same log pipeline with lower overhead than the serial console.
+//! With `--jailer`, the VMM boots inside `firecracker-jailer` instead, and
+//! the serial console is unavailable: guests must log over vsock there.
 //!
 //! Before booting, the agent writes `bigtop-vm.json` into the task's VM dir:
 //! a read-only record of exactly what the `REST` calls configure, for
 //! inspection and replay. The API stays the source of truth.
 //!
-//! v0.1 notes: no jailer sandboxing, no vsock log channel, no snapshot
-//! support. Those are v0.2. End-to-end microVM boot needs `/dev/kvm` and
-//! is unverified in CI-like environments; the config builders below are
-//! unit-tested, including against a fake API socket.
+//! End-to-end microVM boot needs `/dev/kvm` and is unverified in CI-like
+//! environments; the config builders below are unit-tested, including
+//! against a fake API socket.
 
+use crate::jailer::{JailerConfig, JailerOptions, JAILED_API_SOCK, JAILED_LOG_PATH};
 use crate::runtime::{RunningTask, Runtime};
+use crate::snapshot::{resolve_snapshot_paths, SnapshotManager};
+use crate::vsock::{serve_vsock_logs, VsockLogHub, VSOCK_LOG_PORT};
 use crate::AgentError;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use bigtop_core::{Task, TaskId};
+use bigtop_core::{SnapshotId, SnapshotLoadSpec, SnapshotSpec, Task, TaskId};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::net::UnixListener;
 use tokio::process::Command;
+use tokio::sync::oneshot;
 
 /// Configuration for [`FirecrackerRuntime`].
 #[derive(Debug, Clone)]
@@ -34,6 +47,9 @@ pub struct FirecrackerConfig {
     pub vm_dir: PathBuf,
     /// How long to wait for the API socket after spawning the VMM.
     pub boot_timeout: Duration,
+    /// Sandbox every microVM in `firecracker-jailer`. `None` spawns
+    /// firecracker directly.
+    pub jailer: Option<JailerOptions>,
 }
 
 impl Default for FirecrackerConfig {
@@ -42,6 +58,7 @@ impl Default for FirecrackerConfig {
             bin: PathBuf::from("firecracker"),
             vm_dir: PathBuf::from("/tmp/bigtop-vms"),
             boot_timeout: Duration::from_secs(10),
+            jailer: None,
         }
     }
 }
@@ -50,13 +67,41 @@ impl Default for FirecrackerConfig {
 #[derive(Debug, Clone)]
 pub struct FirecrackerRuntime {
     config: FirecrackerConfig,
+    /// When set, fresh boots get a virtio-vsock device and the agent serves
+    /// the guest's log connections into this hub. `None` means serial
+    /// console only.
+    vsock_hub: Option<VsockLogHub>,
+}
+
+/// virtio-vsock backing socket, as the *firecracker process* sees it.
+/// In jailer mode this is inside the chroot; the agent maps it back to the
+/// host when binding the listener.
+const JAILED_VSOCK_SOCK: &str = "/vsock.sock";
+
+/// How a microVM boots: fresh (kernel + rootfs) or from a snapshot.
+#[derive(Debug, Clone, Copy)]
+pub enum BootKind<'a> {
+    /// Kernel + rootfs, configured via `PUT /machine-config` and friends.
+    Fresh,
+    /// `PUT /snapshot/load` with `resume_vm`; images are not needed.
+    Snapshot(&'a SnapshotLoadSpec),
 }
 
 impl FirecrackerRuntime {
     /// Build a runtime from `config`.
     #[must_use]
     pub const fn new(config: FirecrackerConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            vsock_hub: None,
+        }
+    }
+
+    /// Serve guest vsock log connections into `hub` on fresh boots.
+    #[must_use]
+    pub fn with_vsock_hub(mut self, hub: VsockLogHub) -> Self {
+        self.vsock_hub = Some(hub);
+        self
     }
 
     /// Unix socket path for a task's VMM API.
@@ -65,9 +110,103 @@ impl FirecrackerRuntime {
         self.config.vm_dir.join(task_id.to_string()).join("fc.sock")
     }
 
+    /// Task VM working directory (`<vm_dir>/<task-id>/`): socket (direct
+    /// mode), `bigtop-vm.json`, and default snapshot files.
+    #[must_use]
+    pub fn vm_task_dir(&self, task_id: &TaskId) -> PathBuf {
+        self.config.vm_dir.join(task_id.to_string())
+    }
+
+    /// Base VM directory from the config.
+    #[must_use]
+    pub fn vm_dir(&self) -> &Path {
+        &self.config.vm_dir
+    }
+
+    /// API socket path the *agent* dials. In jailer mode the socket lives
+    /// inside the jail, so this maps the jailed path back to the host.
+    #[must_use]
+    pub fn api_socket_for(&self, task_id: &TaskId) -> PathBuf {
+        self.config.jailer.as_ref().map_or_else(
+            || self.socket_path(task_id),
+            |opts| {
+                JailerConfig::new(task_id.to_string(), opts, self.config.bin.clone())
+                    .host_path(Path::new(JAILED_API_SOCK))
+            },
+        )
+    }
+
+    /// Host path of the vsock backing socket for `task_id`. Firecracker
+    /// itself binds `uds_path`; the agent binds the per-port listener at
+    /// [`Self::vsock_listen_path`].
+    fn vsock_backing_host_path(&self, task_id: &TaskId) -> PathBuf {
+        self.config.jailer.as_ref().map_or_else(
+            || self.vm_task_dir(task_id).join("vsock.sock"),
+            |opts| {
+                JailerConfig::new(task_id.to_string(), opts, self.config.bin.clone())
+                    .host_path(Path::new(JAILED_VSOCK_SOCK))
+            },
+        )
+    }
+
+    /// vsock backing socket as the *firecracker process* sees it: the
+    /// `uds_path` sent in `PUT /vsock`.
+    fn vsock_device_path(&self, task_id: &TaskId) -> PathBuf {
+        if self.config.jailer.is_some() {
+            PathBuf::from(JAILED_VSOCK_SOCK)
+        } else {
+            self.vsock_backing_host_path(task_id)
+        }
+    }
+
+    /// Agent-side listener path: Firecracker pairs guest connections to
+    /// `(CID 2, VSOCK_LOG_PORT)` with the `AF_UNIX` listener at
+    /// `<uds_path>_<port>`. Always a host path, even in jailer mode.
+    fn vsock_listen_path(&self, task_id: &TaskId) -> PathBuf {
+        let mut path = self.vsock_backing_host_path(task_id).into_os_string();
+        path.push(format!("_{VSOCK_LOG_PORT}"));
+        PathBuf::from(path)
+    }
+
+    /// Take a snapshot of `task_id`'s running microVM per `spec`.
+    ///
+    /// Resolves default paths, creates the snapshot directory, and calls
+    /// `PUT /snapshot/create`. Returns the resolved `(mem_file_path,
+    /// snapshot_path)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] when the API socket is unreachable or
+    /// Firecracker rejects the call.
+    pub async fn take_snapshot(
+        &self,
+        task_id: &TaskId,
+        snapshot_id: &SnapshotId,
+        spec: &SnapshotSpec,
+    ) -> Result<(PathBuf, PathBuf), AgentError> {
+        let (mem, snap) = resolve_snapshot_paths(spec, &self.config.vm_dir, task_id, snapshot_id);
+        if let Some(parent) = mem.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(AgentError::Io)?;
+        }
+        let resolved = SnapshotSpec {
+            snapshot_type: spec.snapshot_type,
+            mem_file_path: mem.to_string_lossy().into_owned(),
+            snapshot_path: snap.to_string_lossy().into_owned(),
+        };
+        let sock = self.api_socket_for(task_id);
+        SnapshotManager::create(&sock, &resolved).await?;
+        Ok((mem, snap))
+    }
+
     /// Configure a freshly spawned VMM, then start the instance.
     /// `vcpu_count`, `mem_mb`, and `boot_args` are the values recorded in
     /// `bigtop-vm.json`, so the API calls can never drift from the record.
+    /// The caller waits for the API socket first. When the runtime serves
+    /// vsock logs, the virtio-vsock device is configured before the
+    /// instance starts; the agent's per-task listener is already bound by
+    /// then (see [`FirecrackerRuntime::spawn`]).
     async fn configure(
         &self,
         sock: &Path,
@@ -76,7 +215,6 @@ impl FirecrackerRuntime {
         mem_mb: u64,
         boot_args: &str,
     ) -> Result<(), AgentError> {
-        wait_for_socket(sock, self.config.boot_timeout).await?;
         let vm = &task.spec.vm;
         fc_put(
             sock,
@@ -91,58 +229,53 @@ impl FirecrackerRuntime {
         )
         .await?;
         fc_put(sock, "/drives/rootfs", &drive_body(&vm.rootfs)).await?;
+        if self.vsock_hub.is_some() {
+            fc_put(
+                sock,
+                "/vsock",
+                &vsock_device_body(guest_cid_for(&task.id), &self.vsock_device_path(&task.id)),
+            )
+            .await?;
+        }
         fc_put(sock, "/actions", &instance_start_body()).await?;
         Ok(())
     }
-}
 
-impl Runtime for FirecrackerRuntime {
-    async fn spawn(&self, task: &Task) -> Result<RunningTask, AgentError> {
-        let vm = &task.spec.vm;
-        if vm.kernel_image.trim().is_empty() {
-            return Err(AgentError::ImageMissing(
-                "vm.kernel_image is empty".to_string(),
-            ));
+    /// Spawn the VMM process: `firecracker` directly, or `jailer` when the    /// config enables it. Returns the child plus the jailer argv when used
+    /// (`None` for direct spawns).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Spawn`] when the process cannot be started.
+    fn spawn_vmm(
+        &self,
+        task: &Task,
+        api_sock: &Path,
+    ) -> Result<(tokio::process::Child, Option<Vec<String>>), AgentError> {
+        if let Some(opts) = &self.config.jailer {
+            let jailer = JailerConfig::new(task.id.to_string(), opts, self.config.bin.clone());
+            let fc_args = vec![
+                "--api-sock".to_string(),
+                JAILED_API_SOCK.to_string(),
+                "--log-path".to_string(),
+                JAILED_LOG_PATH.to_string(),
+                "--id".to_string(),
+                task.id.to_string(),
+            ];
+            let argv = jailer.argv(&fc_args);
+            let child = Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(AgentError::Spawn)?;
+            return Ok((child, Some(argv)));
         }
-        if vm.rootfs.trim().is_empty() {
-            return Err(AgentError::ImageMissing("vm.rootfs is empty".to_string()));
-        }
-        let vm_task_dir = self.config.vm_dir.join(task.id.to_string());
-        tokio::fs::create_dir_all(&vm_task_dir)
-            .await
-            .map_err(AgentError::Io)?;
-        let sock = self.socket_path(&task.id);
-        if tokio::fs::try_exists(&sock).await.map_err(AgentError::Io)? {
-            tokio::fs::remove_file(&sock)
-                .await
-                .map_err(AgentError::Io)?;
-        }
-        // Fail fast on missing images instead of a cryptic API error later.
-        for (label, path) in [
-            ("kernel_image", vm.kernel_image.as_str()),
-            ("rootfs", vm.rootfs.as_str()),
-        ] {
-            if !tokio::fs::try_exists(path).await.map_err(AgentError::Io)? {
-                return Err(AgentError::ImageMissing(format!(
-                    "vm.{label} not found: {path}"
-                )));
-            }
-        }
-        // Render the exact values the REST calls will use, and record them
-        // in bigtop-vm.json before the VMM boots.
-        let vcpu_count = vcpu_for(task.spec.resources.cpu_millis, vm.vcpu_count);
-        let mem_mb = vm.mem_mb.max(64);
-        let args = boot_args(vm.boot_args.as_deref(), task);
-        let record = serde_json::to_string_pretty(&launch_config_json(
-            task, vcpu_count, mem_mb, &args, &sock,
-        ))
-        .map_err(AgentError::Json)?;
-        tokio::fs::write(vm_task_dir.join("bigtop-vm.json"), record)
-            .await
-            .map_err(AgentError::Io)?;
-        let mut child = Command::new(&self.config.bin)
+        let vm_task_dir = self.vm_task_dir(&task.id);
+        let child = Command::new(&self.config.bin)
             .arg("--api-sock")
-            .arg(&sock)
+            .arg(api_sock)
             .arg("--log-path")
             .arg(vm_task_dir.join("firecracker.log"))
             .arg("--id")
@@ -152,7 +285,127 @@ impl Runtime for FirecrackerRuntime {
             .kill_on_drop(true)
             .spawn()
             .map_err(AgentError::Spawn)?;
-        if let Err(e) = self.configure(&sock, task, vcpu_count, mem_mb, &args).await {
+        Ok((child, None))
+    }
+
+    /// Bind this task's vsock log listener and serve guest connections into
+    /// the hub. Returns the stop signal for [`RunningTask::vsock_stop`]
+    /// (`None` when the runtime does not serve vsock logs).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Io`] when the listener socket cannot be bound.
+    async fn start_vsock_server(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<oneshot::Sender<()>>, AgentError> {
+        let Some(hub) = self.vsock_hub.clone() else {
+            return Ok(None);
+        };
+        let listen_path = self.vsock_listen_path(task_id);
+        if tokio::fs::try_exists(&listen_path)
+            .await
+            .map_err(AgentError::Io)?
+        {
+            tokio::fs::remove_file(&listen_path)
+                .await
+                .map_err(AgentError::Io)?;
+        }
+        let listener = UnixListener::bind(&listen_path).map_err(AgentError::Io)?;
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::select! {
+                result = serve_vsock_logs(hub, listener) => {
+                    if let Err(e) = result {
+                        eprintln!("bigtop agent: vsock log server failed: {e}");
+                    }
+                }
+                _ = &mut stop_rx => {}
+            }
+            let _ = tokio::fs::remove_file(&listen_path).await;
+        });
+        Ok(Some(stop_tx))
+    }
+}
+
+impl Runtime for FirecrackerRuntime {
+    async fn spawn(&self, task: &Task) -> Result<RunningTask, AgentError> {
+        let vm = &task.spec.vm;
+        let boot = vm
+            .boot_snapshot
+            .as_ref()
+            .map_or(BootKind::Fresh, BootKind::Snapshot);
+        let jailed = self.config.jailer.is_some();
+        if !jailed {
+            // Fresh boots need images; snapshot boots carry their own block
+            // devices. In jailer mode the image paths are interpreted inside
+            // the jail, so the host-side check is skipped: the operator must
+            // make them visible there (see README "Jailer host setup").
+            if vm.kernel_image.trim().is_empty() {
+                return Err(AgentError::ImageMissing(
+                    "vm.kernel_image is empty".to_string(),
+                ));
+            }
+            if vm.rootfs.trim().is_empty() {
+                return Err(AgentError::ImageMissing("vm.rootfs is empty".to_string()));
+            }
+            for (label, path) in [
+                ("kernel_image", vm.kernel_image.as_str()),
+                ("rootfs", vm.rootfs.as_str()),
+            ] {
+                if !tokio::fs::try_exists(path).await.map_err(AgentError::Io)? {
+                    return Err(AgentError::ImageMissing(format!(
+                        "vm.{label} not found: {path}"
+                    )));
+                }
+            }
+        }
+        let vm_task_dir = self.vm_task_dir(&task.id);
+        tokio::fs::create_dir_all(&vm_task_dir)
+            .await
+            .map_err(AgentError::Io)?;
+        let api_sock = self.api_socket_for(&task.id);
+        if !jailed
+            && tokio::fs::try_exists(&api_sock)
+                .await
+                .map_err(AgentError::Io)?
+        {
+            tokio::fs::remove_file(&api_sock)
+                .await
+                .map_err(AgentError::Io)?;
+        }
+        // Render the exact values the REST calls will use, and record them
+        // in bigtop-vm.json before the VMM boots.
+        let vcpu_count = vcpu_for(task.spec.resources.cpu_millis, vm.vcpu_count);
+        let mem_mb = vm.mem_mb.max(64);
+        let args = boot_args(vm.boot_args.as_deref(), task);
+        let (mut child, jailer_argv) = self.spawn_vmm(task, &api_sock)?;
+        let record = serde_json::to_string_pretty(&launch_record(
+            task,
+            boot,
+            vcpu_count,
+            mem_mb,
+            &args,
+            &api_sock,
+            jailer_argv.as_deref(),
+        ))
+        .map_err(AgentError::Json)?;
+        tokio::fs::write(vm_task_dir.join("bigtop-vm.json"), record)
+            .await
+            .map_err(AgentError::Io)?;
+        wait_for_socket(&api_sock, self.config.boot_timeout).await?;
+        // Bind the per-task vsock listener before the guest can dial: the
+        // guest connects to (CID 2, VSOCK_LOG_PORT) and Firecracker pairs it
+        // with the AF_UNIX socket at <uds_path>_<port>.
+        let vsock_stop = self.start_vsock_server(&task.id).await?;
+        let booted = match &boot {
+            BootKind::Fresh => {
+                self.configure(&api_sock, task, vcpu_count, mem_mb, &args)
+                    .await
+            }
+            BootKind::Snapshot(load) => SnapshotManager::load(&api_sock, load).await,
+        };
+        if let Err(e) = booted {
             let _ = child.kill().await;
             return Err(e);
         }
@@ -160,6 +413,7 @@ impl Runtime for FirecrackerRuntime {
             task_id: task.id.clone(),
             child,
             vm_dir: Some(vm_task_dir),
+            vsock_stop,
         })
     }
 }
@@ -208,19 +462,43 @@ pub fn instance_start_body() -> serde_json::Value {
     json!({ "action_type": "InstanceStart" })
 }
 
+/// `PUT /vsock` body: give the guest `guest_cid` and back its virtio-vsock
+/// device with the `AF_UNIX` socket at `uds_path`. Firecracker binds
+/// `uds_path` itself; the agent listens for guest log connections at
+/// `<uds_path>_<port>`.
+#[must_use]
+pub fn vsock_device_body(guest_cid: u32, uds_path: &Path) -> serde_json::Value {
+    json!({ "guest_cid": guest_cid, "uds_path": uds_path })
+}
+
+/// Deterministic guest CID for `task_id`, in `3..=u32::MAX - 1`
+/// (`0`/`1`/`2` and `u32::MAX` are reserved). Derived from the task id so
+/// a retried task keeps its CID across agent restarts.
+#[must_use]
+pub fn guest_cid_for(task_id: &TaskId) -> u32 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    task_id.to_string().hash(&mut hasher);
+    let digest = hasher.finish();
+    u32::try_from(3 + digest % u64::from(u32::MAX - 3)).unwrap_or(3)
+}
+
 /// The `bigtop-vm.json` record: everything the agent configures for one
 /// task's microVM, written before the VMM boots. It mirrors the `REST` API
 /// bodies so an operator can inspect or replay a task's VM from the file
 /// alone; the API stays the source of truth.
 #[must_use]
-pub fn launch_config_json(
+pub fn launch_record(
     task: &Task,
+    boot: BootKind<'_>,
     vcpu_count: u32,
     mem_mb: u64,
     boot_args: &str,
     api_sock: &Path,
+    jailer_argv: Option<&[String]>,
 ) -> serde_json::Value {
-    json!({
+    let mut record = json!({
         "task_id": task.id.to_string(),
         "job_id": task.job_id.to_string(),
         "created_at": chrono::Utc::now().to_rfc3339(),
@@ -233,7 +511,21 @@ pub fn launch_config_json(
         "args": task.spec.args,
         "env": task.spec.env,
         "api_socket": api_sock.to_string_lossy(),
-    })
+    });
+    match boot {
+        BootKind::Fresh => {
+            record["boot"] = json!("fresh");
+        }
+        BootKind::Snapshot(load) => {
+            record["boot"] = json!("snapshot");
+            record["snapshot_path"] = json!(load.snapshot_path);
+            record["mem_file_path"] = json!(load.mem_file_path);
+        }
+    }
+    if let Some(argv) = jailer_argv {
+        record["jailer_argv"] = json!(argv);
+    }
+    record
 }
 
 /// Join command + args + env into one shell line, single-quote escaped.
@@ -279,7 +571,7 @@ pub fn boot_args(base: Option<&str>, task: &Task) -> String {
 }
 
 /// Wait until the VMM's API socket appears.
-async fn wait_for_socket(sock: &Path, timeout: Duration) -> Result<(), AgentError> {
+pub async fn wait_for_socket(sock: &Path, timeout: Duration) -> Result<(), AgentError> {
     let start = tokio::time::Instant::now();
     while start.elapsed() < timeout {
         if tokio::fs::try_exists(sock).await.map_err(AgentError::Io)? {
@@ -295,7 +587,7 @@ async fn wait_for_socket(sock: &Path, timeout: Duration) -> Result<(), AgentErro
 
 /// `PUT` a JSON body to the Firecracker API over its Unix socket.
 /// Success is any 2xx status.
-async fn fc_put(sock: &Path, path: &str, body: &serde_json::Value) -> Result<(), AgentError> {
+pub async fn fc_put(sock: &Path, path: &str, body: &serde_json::Value) -> Result<(), AgentError> {
     let body_str = serde_json::to_string(body).map_err(AgentError::Json)?;
     let request = format!(
         "PUT {path} HTTP/1.1\r\n\
@@ -352,7 +644,9 @@ fn parse_status(response: &[u8]) -> (u16, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bigtop_core::{JobId, Resources, TaskSpec, TaskState, VmSpec};
+    use bigtop_core::{
+        JobId, Resources, SnapshotLoadSpec, SnapshotPolicy, TaskSpec, TaskState, VmSpec,
+    };
     use std::collections::HashMap;
 
     fn test_task() -> Task {
@@ -376,7 +670,10 @@ mod tests {
                     vcpu_count: 1,
                     mem_mb: 128,
                     boot_args: None,
+                    boot_snapshot: None,
                 },
+                node_affinity: None,
+                snapshot_policy: SnapshotPolicy::None,
             },
             state: TaskState::Pending,
             assigned_node: None,
@@ -392,6 +689,43 @@ mod tests {
         assert_eq!(vcpu_for(1500, 1), 2);
         assert_eq!(vcpu_for(500, 4), 4);
         assert_eq!(vcpu_for(0, 0), 1);
+    }
+
+    #[test]
+    fn vsock_device_body_shape() {
+        let body = vsock_device_body(7, Path::new("/tmp/bigtop-vms/task-1/vsock.sock"));
+        assert_eq!(body["guest_cid"], 7);
+        assert_eq!(body["uds_path"], "/tmp/bigtop-vms/task-1/vsock.sock");
+    }
+
+    #[test]
+    fn guest_cid_is_deterministic_and_in_range() {
+        let first = guest_cid_for(&TaskId::from("task-abc".to_string()));
+        assert_eq!(first, guest_cid_for(&TaskId::from("task-abc".to_string())));
+        for id in ["task-1", "task-abc", "x", ""] {
+            let cid = guest_cid_for(&TaskId::from(id.to_string()));
+            assert!((3..=u32::MAX - 1).contains(&cid), "cid {cid} out of range");
+        }
+        // Distinct task ids should (almost surely) map to distinct CIDs.
+        let other = guest_cid_for(&TaskId::from("task-abd".to_string()));
+        assert_ne!(first, other);
+    }
+
+    #[test]
+    fn vsock_paths_shape() {
+        let rt = FirecrackerRuntime::new(FirecrackerConfig {
+            vm_dir: PathBuf::from("/tmp/bigtop-vms"),
+            ..FirecrackerConfig::default()
+        });
+        let task_id = TaskId::from("task-1".to_string());
+        assert_eq!(
+            rt.vsock_device_path(&task_id),
+            PathBuf::from("/tmp/bigtop-vms/task-1/vsock.sock")
+        );
+        assert_eq!(
+            rt.vsock_listen_path(&task_id),
+            PathBuf::from("/tmp/bigtop-vms/task-1/vsock.sock_4668")
+        );
     }
 
     #[test]
@@ -426,7 +760,7 @@ mod tests {
         let mem_mb = task.spec.vm.mem_mb.max(64);
         let args = boot_args(task.spec.vm.boot_args.as_deref(), &task);
         let sock = Path::new("/tmp/vm/fc.sock");
-        let cfg = launch_config_json(&task, vcpu, mem_mb, &args, sock);
+        let cfg = launch_record(&task, BootKind::Fresh, vcpu, mem_mb, &args, sock, None);
         // Same numbers the REST calls send.
         assert_eq!(
             cfg["vcpu_count"],
@@ -446,10 +780,54 @@ mod tests {
         assert_eq!(cfg["job_id"], "job-1");
         assert_eq!(cfg["command"], "echo");
         assert_eq!(cfg["api_socket"], "/tmp/vm/fc.sock");
+        assert_eq!(cfg["boot"], "fresh");
+        assert!(cfg.get("jailer_argv").is_none());
         // Serializes cleanly, which is what the agent writes to disk.
         let text = serde_json::to_string_pretty(&cfg).expect("serialize");
         let back: serde_json::Value = serde_json::from_str(&text).expect("deserialize");
         assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn launch_record_captures_snapshot_boot() {
+        let task = test_task();
+        let load = SnapshotLoadSpec {
+            mem_file_path: "/vms/t/task-abc.snap.mem".to_string(),
+            snapshot_path: "/vms/t/task-abc.snap".to_string(),
+            enable_diff_snapshots: true,
+        };
+        let cfg = launch_record(
+            &task,
+            BootKind::Snapshot(&load),
+            2,
+            256,
+            "console=ttyS0",
+            Path::new("/tmp/vm/fc.sock"),
+            None,
+        );
+        assert_eq!(cfg["boot"], "snapshot");
+        assert_eq!(cfg["snapshot_path"], "/vms/t/task-abc.snap");
+        assert_eq!(cfg["mem_file_path"], "/vms/t/task-abc.snap.mem");
+    }
+
+    #[test]
+    fn launch_record_captures_jailer_argv() {
+        let task = test_task();
+        let argv = vec![
+            "jailer".to_string(),
+            "--id".to_string(),
+            "task-abc".to_string(),
+        ];
+        let cfg = launch_record(
+            &task,
+            BootKind::Fresh,
+            1,
+            128,
+            "console=ttyS0",
+            Path::new("/srv/jailer/task-abc/root/fc.sock"),
+            Some(&argv),
+        );
+        assert_eq!(cfg["jailer_argv"], json!(argv));
     }
 
     #[test]

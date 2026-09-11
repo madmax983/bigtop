@@ -10,10 +10,11 @@ use axum::{
 };
 use bigtop_core::{
     api::{
-        JobSummary, LogLinesResponse, PushLogsRequest, RegisterNodeRequest, RegisterNodeResponse,
-        SetTaskStateRequest, SubmitJobResponse,
+        JobSummary, LogLinesResponse, PendingSnapshot, PushLogsRequest, RegisterNodeRequest,
+        RegisterNodeResponse, ReportSnapshotResult, RequestSnapshotRequest,
+        RequestSnapshotResponse, SetTaskStateRequest, SubmitJobResponse,
     },
-    Error, JobSpec, NodeId, NodeInfo, Task, TaskId, TaskState,
+    Error, JobSpec, NodeId, NodeInfo, SnapshotId, SnapshotRecord, Task, TaskId, TaskState,
 };
 use chrono::Utc;
 use serde::Deserialize;
@@ -30,6 +31,13 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/nodes/register", post(register_node))
         .route("/v1/nodes/{id}/heartbeat", post(heartbeat))
         .route("/v1/agents/assignments", get(assignments))
+        .route("/v1/agents/snapshot-requests", get(snapshot_requests))
+        .route("/v1/tasks/{id}/snapshot", post(request_snapshot))
+        .route("/v1/tasks/{id}/snapshots", get(list_snapshots))
+        .route(
+            "/v1/tasks/{id}/snapshots/{snapshot_id}/result",
+            post(report_snapshot_result),
+        )
         .with_state(state)
 }
 
@@ -184,4 +192,55 @@ async fn get_logs(
             .collect::<Vec<String>>()
     };
     Ok(Json(LogLinesResponse { lines }))
+}
+
+async fn request_snapshot(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+    Json(req): Json<RequestSnapshotRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let snapshot_id = {
+        let mut inner = state.inner.write().await;
+        state::request_snapshot(&mut inner, &id, &req, Utc::now()).map_err(ApiError)?
+    };
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RequestSnapshotResponse { snapshot_id }),
+    ))
+}
+
+async fn list_snapshots(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> Result<Json<Vec<SnapshotRecord>>, ApiError> {
+    let records = {
+        let inner = state.inner.read().await;
+        state::task_snapshots(&inner, &id).map_err(ApiError)?
+    };
+    Ok(Json(records))
+}
+
+#[derive(Deserialize)]
+struct SnapshotRequestsQuery {
+    node_id: NodeId,
+}
+
+async fn snapshot_requests(
+    State(state): State<AppState>,
+    Query(query): Query<SnapshotRequestsQuery>,
+) -> Json<Vec<PendingSnapshot>> {
+    let inner = state.inner.read().await;
+    Json(state::snapshot_requests_for_node(&inner, &query.node_id))
+}
+
+async fn report_snapshot_result(
+    State(state): State<AppState>,
+    Path((id, snapshot_id)): Path<(TaskId, SnapshotId)>,
+    Json(req): Json<ReportSnapshotResult>,
+) -> Result<impl IntoResponse, ApiError> {
+    {
+        let mut inner = state.inner.write().await;
+        state::report_snapshot_result(&mut inner, &id, &snapshot_id, &req).map_err(ApiError)?;
+    }
+    Ok(Json(json!({ "ok": true })))
 }

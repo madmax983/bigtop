@@ -56,6 +56,11 @@ macro_rules! define_id {
 define_id!(JobId, "job", "Unique identifier for a `BigTop` job.");
 define_id!(TaskId, "task", "Unique identifier for a single task.");
 define_id!(NodeId, "node", "Unique identifier for an agent node.");
+define_id!(
+    SnapshotId,
+    "snap",
+    "Unique identifier for a microVM snapshot request."
+);
 
 #[cfg(test)]
 mod tests {

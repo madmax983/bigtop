@@ -6,12 +6,17 @@
 pub mod api;
 pub mod error;
 pub mod ids;
+pub mod snapshots;
 pub mod types;
 
 pub use api::{
-    JobSummary, LogLinesResponse, PushLogsRequest, RegisterNodeRequest, RegisterNodeResponse,
+    JobSummary, LogLinesResponse, PendingSnapshot, PushLogsRequest, RegisterNodeRequest,
+    RegisterNodeResponse, ReportSnapshotResult, RequestSnapshotRequest, RequestSnapshotResponse,
     SetTaskStateRequest, SubmitJobResponse,
 };
 pub use error::Error;
-pub use ids::{JobId, NodeId, TaskId};
+pub use ids::{JobId, NodeId, SnapshotId, TaskId};
+pub use snapshots::{
+    SnapshotLoadSpec, SnapshotPolicy, SnapshotRecord, SnapshotSpec, SnapshotState, SnapshotType,
+};
 pub use types::{JobSpec, NodeInfo, Resources, Task, TaskSpec, TaskState, VmSpec};

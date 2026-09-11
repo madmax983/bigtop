@@ -11,7 +11,7 @@
 //!    determinism.
 
 use crate::state::StateInner;
-use bigtop_core::{NodeId, NodeInfo, Resources, TaskId, TaskState};
+use bigtop_core::{NodeId, NodeInfo, Resources, Task, TaskId, TaskState};
 use chrono::{DateTime, Utc};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -79,16 +79,16 @@ fn place_pending(inner: &mut StateInner, now: DateTime<Utc>) {
         .collect();
     pending.sort();
     for task_id in pending {
-        let need = match inner.tasks.get(&task_id) {
-            Some(task) => task.spec.resources,
+        let task = match inner.tasks.get(&task_id) {
+            Some(task) => task.clone(),
             None => continue,
         };
-        if let Some(node_id) = pick_node(inner, need, now) {
+        if let Some(node_id) = pick_node(inner, &task, now) {
             let placed = match (inner.tasks.get_mut(&task_id), inner.nodes.get_mut(&node_id)) {
                 (Some(task), Some(node)) => {
                     task.state = TaskState::Assigned;
                     task.assigned_node = Some(node.id.clone());
-                    node.used = node.used.saturating_add(need);
+                    node.used = node.used.saturating_add(task.spec.resources);
                     true
                 }
                 _ => false,
@@ -98,12 +98,22 @@ fn place_pending(inner: &mut StateInner, now: DateTime<Utc>) {
     }
 }
 
-/// The alive node with the lowest load that fits `need`, if any.
-fn pick_node(inner: &StateInner, need: Resources, now: DateTime<Utc>) -> Option<NodeId> {
+/// The alive node with the lowest load that fits the task, if any.
+/// A task with `node_affinity` is only eligible on its pinned node.
+fn pick_node(inner: &StateInner, task: &Task, now: DateTime<Utc>) -> Option<NodeId> {
+    let need = task.spec.resources;
     inner
         .nodes
         .values()
-        .filter(|node| node.is_alive(now) && need.fits_in(node.total, node.used))
+        .filter(|node| {
+            node.is_alive(now)
+                && need.fits_in(node.total, node.used)
+                && task
+                    .spec
+                    .node_affinity
+                    .as_ref()
+                    .is_none_or(|pinned| *pinned == node.id)
+        })
         .min_by(|a, b| cmp_load(a, b).then_with(|| a.id.to_string().cmp(&b.id.to_string())))
         .map(|node| node.id.clone())
 }
@@ -129,7 +139,7 @@ fn cmp_load(a: &NodeInfo, b: &NodeInfo) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bigtop_core::{JobId, NodeId, Task, TaskSpec, VmSpec};
+    use bigtop_core::{JobId, NodeId, SnapshotPolicy, Task, TaskSpec, VmSpec};
     use std::collections::HashMap;
 
     fn node(id: &str, cpu: u64, mem: u64, now: DateTime<Utc>) -> NodeInfo {
@@ -167,7 +177,10 @@ mod tests {
                     vcpu_count: 1,
                     mem_mb: 128,
                     boot_args: None,
+                    boot_snapshot: None,
                 },
+                node_affinity: None,
+                snapshot_policy: SnapshotPolicy::None,
             },
             state: TaskState::Pending,
             assigned_node: None,
@@ -234,6 +247,39 @@ mod tests {
         let task = inner
             .tasks
             .get(&TaskId::from("task-big".to_string()))
+            .expect("task");
+        assert_eq!(task.state, TaskState::Pending);
+        assert_eq!(task.assigned_node, None);
+    }
+
+    #[test]
+    fn node_affinity_pins_placement() {
+        let now = Utc::now();
+        let mut inner = cluster(now);
+        // Without affinity this task would land on node-a (tie, lower id).
+        let mut t = task("task-pinned", 100, 64);
+        t.spec.node_affinity = Some(NodeId::from("node-b".to_string()));
+        inner.tasks.insert(t.id.clone(), t);
+        tick(&mut inner, now);
+        let task = inner
+            .tasks
+            .get(&TaskId::from("task-pinned".to_string()))
+            .expect("task");
+        assert_eq!(task.state, TaskState::Assigned);
+        assert_eq!(task.assigned_node, Some(NodeId::from("node-b".to_string())));
+    }
+
+    #[test]
+    fn affinity_to_missing_node_stays_pending() {
+        let now = Utc::now();
+        let mut inner = cluster(now);
+        let mut t = task("task-lost", 100, 64);
+        t.spec.node_affinity = Some(NodeId::from("node-gone".to_string()));
+        inner.tasks.insert(t.id.clone(), t);
+        tick(&mut inner, now);
+        let task = inner
+            .tasks
+            .get(&TaskId::from("task-lost".to_string()))
             .expect("task");
         assert_eq!(task.state, TaskState::Pending);
         assert_eq!(task.assigned_node, None);

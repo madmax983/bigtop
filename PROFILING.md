@@ -52,6 +52,32 @@ cargo bench -p bigtop-server
 Baselines get recorded here once measured on a fixed machine. Numbers move
 with hardware; always note the machine when updating them.
 
+## v0.2 hot-path notes
+
+v0.2 adds three agent-side code paths. None changes the scheduler or
+server hot paths:
+
+- **Vsock frame decode** (`bigtop-agent/src/vsock.rs`): one
+  `u32` length-prefix check, then a single `vec![0u8; len - 1]` + one
+  `read_exact` per log line. The length cap (`MAX_FRAME_PAYLOAD = 1 MiB`)
+  is enforced *before* allocation, so a malicious guest cannot force a
+  huge alloc. Per-line cost is one allocation of exactly the payload
+  size — no reallocation, no copies beyond the kernel read.
+- **Snapshot requests**: one HTTP round-trip per request plus one
+  `PUT /snapshot/create` to the VMM socket. Rare (operator-driven or
+  once per task for `OnSuccess`), not a hot path.
+- **Jailer argv construction**: string building at spawn time only.
+
+The vsock log merge adds one extra `mpsc` hop (hub channel → forwarder →
+supervise channel) per guest line — two channel sends instead of one.
+Each task also gets one spawned accept task for its `AF_UNIX` listener,
+parked in `accept()` until the first guest connection; it exits (and
+removes its socket file) when the task finishes.
+If log throughput ever shows up in a profile, collapse the forwarder by
+handing the hub the supervise sender directly (at the cost of the channel
+staying open while the hub holds a clone — see the comment in
+`execute_task`).
+
 ## v0.1 baseline numbers
 
 _Unmeasured in this environment._ The sandbox VM runs with load averages

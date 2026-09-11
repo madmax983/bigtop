@@ -32,6 +32,10 @@ pub struct RunningTask {
     pub child: Child,
     /// VM working dir, for runtimes that need one (`None` for processes).
     pub vm_dir: Option<PathBuf>,
+    /// Stop signal for the task's vsock log listener (`None` when the
+    /// runtime does not serve one). The executor sends this when the task
+    /// finishes so the per-task listener does not linger.
+    pub vsock_stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// Spawns tasks as plain OS child processes via `tokio::process`.
@@ -59,6 +63,7 @@ impl Runtime for ProcessRuntime {
                 task_id: task.id.clone(),
                 child,
                 vm_dir: None,
+                vsock_stop: None,
             })
             .map_err(crate::AgentError::Spawn);
         std::future::ready(result)

@@ -2,7 +2,8 @@
 //! see `profiling/profile-scheduler.sh`.
 
 use bigtop_core::{
-    JobId, NodeId, NodeInfo, Resources, SnapshotPolicy, Task, TaskId, TaskSpec, TaskState, VmSpec,
+    JobId, NetworkSpec, NodeId, NodeInfo, Resources, SnapshotPolicy, Task, TaskId, TaskSpec,
+    TaskState, VmSpec,
 };
 use bigtop_server::{tick, StateInner};
 use chrono::Utc;
@@ -60,10 +61,12 @@ fn synthetic_cluster(node_count: usize, task_count: usize) -> StateInner {
                     },
                     node_affinity: None,
                     snapshot_policy: SnapshotPolicy::None,
+                    network: NetworkSpec::default(),
                 },
                 state: TaskState::Pending,
                 assigned_node: None,
                 exit_code: None,
+                network: None,
             },
         );
     }

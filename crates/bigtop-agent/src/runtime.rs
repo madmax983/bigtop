@@ -1,5 +1,6 @@
 //! Task runtimes: how an agent turns an assigned task into something running.
 
+use crate::TapDevice;
 use bigtop_core::{Task, TaskId};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -36,6 +37,10 @@ pub struct RunningTask {
     /// runtime does not serve one). The executor sends this when the task
     /// finishes so the per-task listener does not linger.
     pub vsock_stop: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Host TAP device for guest networking (`None` when the task has no
+    /// `[network]` enabled, or when the runtime does not wire one).
+    /// The executor destroys it after the terminal state is reported.
+    pub tap: Option<TapDevice>,
 }
 
 /// Spawns tasks as plain OS child processes via `tokio::process`.
@@ -64,6 +69,9 @@ impl Runtime for ProcessRuntime {
                 child,
                 vm_dir: None,
                 vsock_stop: None,
+                // Process mode ignores `[network]` entirely: no TAP devices,
+                // so the process-mode demo keeps working with no privileges.
+                tap: None,
             })
             .map_err(crate::AgentError::Spawn);
         std::future::ready(result)

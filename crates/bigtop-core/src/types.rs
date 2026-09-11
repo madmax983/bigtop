@@ -1,6 +1,7 @@
 //! Domain types: resources, VM specs, task specs, tasks, and nodes.
 
 use crate::ids::{JobId, NodeId, TaskId};
+use crate::network::{NetworkAssignment, NetworkSpec};
 use crate::snapshots::{SnapshotLoadSpec, SnapshotPolicy};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -123,6 +124,10 @@ pub struct TaskSpec {
     /// Automatic microVM snapshotting. Only applies to microVM tasks.
     #[serde(default)]
     pub snapshot_policy: SnapshotPolicy,
+    /// Per-task network request, from the `[network]` TOML section.
+    /// Disabled by default.
+    #[serde(default)]
+    pub network: NetworkSpec,
 }
 
 const fn default_count() -> u32 {
@@ -193,6 +198,11 @@ pub struct Task {
     pub assigned_node: Option<NodeId>,
     /// Process exit code, once terminal.
     pub exit_code: Option<i32>,
+    /// The server's IPAM assignment for this task. Set by the server when
+    /// the task's [`NetworkSpec`] is enabled; the agent uses it to configure
+    /// the tap interface.
+    #[serde(default)]
+    pub network: Option<NetworkAssignment>,
 }
 
 /// An agent node known to the server.
@@ -319,6 +329,47 @@ mod tests {
     }
 
     #[test]
+    fn task_spec_with_network_section_parses_end_to_end() {
+        let toml = r#"
+            name = "web"
+
+            [[task]]
+            name = "web-1"
+            command = "serve"
+            args = ["--port", "8080"]
+            count = 2
+
+            [task.resources]
+            cpu_millis = 500
+            mem_mb = 256
+
+            [task.vm]
+            kernel_image = "/boot/vmlinux"
+            rootfs = "/images/rootfs.ext4"
+
+            [task.network]
+            enabled = true
+            hostname = "web-1"
+        "#;
+        let spec: JobSpec = toml::from_str(toml).expect("parse toml");
+        assert_eq!(spec.tasks.len(), 1);
+        let task = &spec.tasks[0];
+        assert_eq!(task.name, "web-1");
+        assert_eq!(task.command, "serve");
+        assert_eq!(task.count, 2);
+        assert_eq!(task.resources.cpu_millis, 500);
+        assert_eq!(task.vm.kernel_image, "/boot/vmlinux");
+        assert!(task.network.enabled);
+        assert_eq!(task.network.hostname.as_deref(), Some("web-1"));
+
+        // Serialization keeps the network section.
+        let json = serde_json::to_string(task).expect("serialize");
+        assert!(json.contains(r#""enabled":true"#));
+        let back: TaskSpec = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(*task, back);
+    }
+
+    #[test]
     fn task_and_node_roundtrip() {
         let task = Task {
             id: TaskId::from("task-1".to_string()),
@@ -341,10 +392,12 @@ mod tests {
                 },
                 node_affinity: None,
                 snapshot_policy: SnapshotPolicy::None,
+                network: NetworkSpec::default(),
             },
             state: TaskState::Pending,
             assigned_node: None,
             exit_code: None,
+            network: None,
         };
         let json = serde_json::to_string(&task).expect("serialize");
         let back: Task = serde_json::from_str(&json).expect("deserialize");

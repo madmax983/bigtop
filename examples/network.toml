@@ -1,0 +1,27 @@
+# BigTop v0.3 example: a job with networking enabled.
+#
+# Each task gets a tap device on its node, a deterministic MAC, and a static
+# IP from the server's IPAM (default pod CIDR 172.28.0.0/16, one /24 per
+# node). The guest configures eth0 from the kernel cmdline — see SPEC.md
+# "Networking (v0.3)" for the guest-side contract.
+name = "netted"
+
+[[task]]
+name = "web"
+command = "sh"
+args = ["-c", "ip addr show eth0 && sleep 30"]
+count = 2
+
+[task.network]
+enabled = true
+hostname = "web"
+
+[task.resources]
+cpu_millis = 200
+mem_mb = 64
+
+[task.vm]
+kernel_image = "/var/lib/bigtop/images/vmlinux"  # guest kernel (vmlinux)
+rootfs = "/var/lib/bigtop/images/rootfs.ext4"    # guest rootfs (ext4)
+vcpu_count = 1
+mem_mb = 128

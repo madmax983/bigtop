@@ -6,7 +6,7 @@ use bigtop_agent::{
     ProcessRuntime, RuntimeKind,
 };
 use bigtop_core::{JobSpec, SnapshotState, SnapshotType, TaskSpec};
-use bigtop_server::serve;
+use bigtop_server::{serve_config, ServerConfig};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 const DEFAULT_SERVER: &str = "http://127.0.0.1:4667";
 
 /// Column headers for `bigtop ps`.
-const PS_HEADERS: [&str; 6] = ["TASK ID", "NAME", "STATE", "EXIT", "NODE", "JOB"];
+const PS_HEADERS: [&str; 7] = ["TASK ID", "NAME", "STATE", "EXIT", "NODE", "IP", "JOB"];
 /// Column headers for `bigtop nodes`.
 const NODES_HEADERS: [&str; 5] = [
     "NODE ID",
@@ -58,6 +58,9 @@ enum Commands {
         /// Address to bind.
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
+        /// Pod network CIDR for per-task IPs (a /16, carved into /24s per node).
+        #[arg(long, default_value = "172.28.0.0/16")]
+        network_cidr: String,
     },
     /// Run the `BigTop` agent.
     Agent {
@@ -191,7 +194,11 @@ struct JobFile {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Server { port, bind } => cmd_server(&bind, port).await,
+        Commands::Server {
+            port,
+            bind,
+            network_cidr,
+        } => cmd_server(&bind, port, &network_cidr).await,
         Commands::Agent {
             server,
             name,
@@ -253,7 +260,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn cmd_server(bind: &str, port: u16) -> Result<()> {
+async fn cmd_server(bind: &str, port: u16, network_cidr: &str) -> Result<()> {
     let addr: std::net::SocketAddr = format!("{bind}:{port}")
         .parse()
         .context("invalid bind address")?;
@@ -261,7 +268,11 @@ async fn cmd_server(bind: &str, port: u16) -> Result<()> {
         .await
         .context("binding server socket")?;
     println!("bigtop server: listening on {addr} (loud and proud)");
-    serve(listener).await?;
+    let config = ServerConfig {
+        tick_interval: std::time::Duration::from_millis(500),
+        network_cidr: network_cidr.to_string(),
+    };
+    serve_config(listener, config).await?;
     Ok(())
 }
 
@@ -345,8 +356,8 @@ async fn cmd_run(job_file: &Path, server: &str) -> Result<()> {
 
 async fn cmd_ps(server: &str) -> Result<()> {
     let tasks: Vec<bigtop_core::Task> = get_json(server, "/v1/tasks").await?;
-    let [task_id, name, state, exit, node, job] = PS_HEADERS;
-    println!("{task_id:<26} {name:<18} {state:<10} {exit:<6} {node:<26} {job}");
+    let [task_id, name, state, exit, node, ip_hdr, job] = PS_HEADERS;
+    println!("{task_id:<26} {name:<18} {state:<10} {exit:<6} {node:<26} {ip_hdr:<15} {job}");
     for task in tasks {
         let node = task
             .assigned_node
@@ -356,13 +367,18 @@ async fn cmd_ps(server: &str) -> Result<()> {
             .exit_code
             .as_ref()
             .map_or_else(|| "-".to_string(), ToString::to_string);
+        let ip = task
+            .network
+            .as_ref()
+            .map_or_else(|| "-".to_string(), |n| n.ip.to_string());
         println!(
-            "{:<26} {:<18} {:<10} {:<6} {:<26} {}",
+            "{:<26} {:<18} {:<10} {:<6} {:<26} {:<15} {}",
             truncate(task.id.as_ref(), 26),
             truncate(&task.name, 18),
             task.state,
             exit,
             truncate(&node, 26),
+            ip,
             task.job_id,
         );
     }

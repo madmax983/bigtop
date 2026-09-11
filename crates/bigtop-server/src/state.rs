@@ -1,5 +1,6 @@
 //! In-memory store and the mutations the API performs on it.
 
+use crate::ipam::Ipam;
 use bigtop_core::{
     Error, JobId, JobSpec, NodeId, NodeInfo, PendingSnapshot, ReportSnapshotResult,
     RequestSnapshotRequest, Resources, SnapshotId, SnapshotRecord, SnapshotSpec, SnapshotState,
@@ -38,6 +39,8 @@ pub struct StateInner {
     pub logs: HashMap<TaskId, VecDeque<String>>,
     /// Snapshot requests and their outcomes, by snapshot id.
     pub snapshots: HashMap<SnapshotId, SnapshotRecord>,
+    /// IP address management for the task network.
+    pub ipam: Ipam,
 }
 
 /// Shared handle to the server state.
@@ -51,6 +54,17 @@ impl AppState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create shared state with a pre-seeded IPAM (the task network base).
+    #[must_use]
+    pub fn with_ipam(ipam: Ipam) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(StateInner {
+                ipam,
+                ..StateInner::default()
+            })),
+        }
     }
 }
 
@@ -112,6 +126,7 @@ pub fn create_job(
                 state: TaskState::Pending,
                 assigned_node: None,
                 exit_code: None,
+                network: None,
             };
             inner.logs.insert(task.id.clone(), VecDeque::new());
             inner.tasks.insert(task.id.clone(), task);
@@ -176,19 +191,26 @@ pub fn set_task_state(
     state: TaskState,
     exit_code: Option<i32>,
 ) -> Result<(), Error> {
-    let task = inner
-        .tasks
-        .get_mut(id)
-        .ok_or_else(|| Error::NotFound(format!("task {id}")))?;
-    if task.state.is_terminal() {
-        return Err(Error::Conflict(format!(
-            "task {id} is already {}",
-            task.state
-        )));
+    let terminal = state.is_terminal();
+    {
+        let task = inner
+            .tasks
+            .get_mut(id)
+            .ok_or_else(|| Error::NotFound(format!("task {id}")))?;
+        if task.state.is_terminal() {
+            return Err(Error::Conflict(format!(
+                "task {id} is already {}",
+                task.state
+            )));
+        }
+        task.state = state;
+        if terminal {
+            task.exit_code = exit_code;
+        }
     }
-    task.state = state;
-    if state.is_terminal() {
-        task.exit_code = exit_code;
+    if terminal {
+        // The task's IP returns to the pool; double-release is safe.
+        let _ = inner.ipam.release(id);
     }
     Ok(())
 }
@@ -361,7 +383,7 @@ pub fn push_logs(inner: &mut StateInner, id: &TaskId, lines: &[String]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bigtop_core::{SnapshotPolicy, SnapshotType, TaskSpec, VmSpec};
+    use bigtop_core::{NetworkSpec, SnapshotPolicy, SnapshotType, TaskSpec, VmSpec};
     use std::collections::HashMap;
 
     fn job_spec(count: u32) -> JobSpec {
@@ -384,6 +406,7 @@ mod tests {
                 },
                 node_affinity: None,
                 snapshot_policy: SnapshotPolicy::None,
+                network: NetworkSpec::default(),
             }],
         }
     }
@@ -418,6 +441,23 @@ mod tests {
         let zero_count = job_spec(0);
         assert!(create_job(&mut inner, &zero_count, Utc::now()).is_err());
         assert!(inner.jobs.is_empty(), "no partial job must remain");
+    }
+
+    #[test]
+    fn terminal_transition_releases_ip() {
+        let mut inner = StateInner::default();
+        create_job(&mut inner, &job_spec(1), Utc::now()).expect("create");
+        let id = inner.tasks.keys().next().expect("task").clone();
+        let node = NodeId::from("node-1".to_string());
+        let ip = inner
+            .ipam
+            .allocate(&node, &id)
+            .expect("allocation must succeed");
+        assert_eq!(inner.ipam.assigned(&id), Some(ip));
+        set_task_state(&mut inner, &id, TaskState::Running, None).expect("running");
+        assert_eq!(inner.ipam.assigned(&id), Some(ip), "non-terminal keeps IP");
+        set_task_state(&mut inner, &id, TaskState::Succeeded, Some(0)).expect("succeeded");
+        assert_eq!(inner.ipam.assigned(&id), None, "terminal releases IP");
     }
 
     #[test]

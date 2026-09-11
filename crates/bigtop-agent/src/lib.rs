@@ -9,6 +9,7 @@ mod firecracker;
 mod jailer;
 mod runtime;
 mod snapshot;
+mod tap;
 mod vsock;
 
 pub use firecracker::{FirecrackerConfig, FirecrackerRuntime};
@@ -17,6 +18,7 @@ pub use runtime::{ProcessRuntime, RunningTask, Runtime};
 pub use snapshot::{
     resolve_snapshot_paths, snapshot_create_body, snapshot_load_body, SnapshotManager,
 };
+pub use tap::TapDevice;
 pub use vsock::{LogFrame, LogStream, VsockLogHub, VSOCK_HOST_CID, VSOCK_LOG_PORT};
 
 use bigtop_core::{
@@ -116,6 +118,10 @@ pub enum AgentError {
     /// The server answered with an error status.
     #[error("server error: {0}")]
     Server(String),
+    /// Guest network setup failed (TAP device, netns, interface wiring).
+    /// Needs `CAP_NET_ADMIN` (or root) and iproute2 on the host.
+    #[error("network setup failed: {0}")]
+    Network(String),
 }
 
 /// Snapshot ids this agent already handles: the poll loop skips them so one
@@ -326,6 +332,9 @@ async fn execute_task(
             // Stops the task's vsock listener once the task is done; the
             // listener task removes its own socket file on exit.
             let vsock_stop = running.vsock_stop;
+            // The host TAP device outlives the guest: destroy it after the
+            // terminal state is reported (best-effort, like `vsock_stop`).
+            let tap = running.tap;
             report_state(&client, &config, &task_id, TaskState::Running, None).await;
             let (state, code) =
                 match supervise(&client, &config, &task_id, running.child, vsock_rx).await {
@@ -345,6 +354,11 @@ async fn execute_task(
             report_state(&client, &config, &task_id, state, code).await;
             if let Some(stop) = vsock_stop {
                 let _ = stop.send(());
+            }
+            if let Some(tap) = tap {
+                if let Err(e) = tap.destroy().await {
+                    eprintln!("bigtop agent: tap destroy failed: {e}");
+                }
             }
         }
         Err(e) => {

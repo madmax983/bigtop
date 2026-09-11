@@ -77,6 +77,13 @@ mem_mb = 128
 # task lands where the snapshot files live. The scheduler only places
 # such tasks on the pinned node; if that node is gone they stay Pending.
 # node_affinity = "node-abc123"
+
+# Networking (v0.3). Disabled by default. When enabled, the server's IPAM
+# assigns the task a static IP on placement and the agent creates a tap
+# device for its microVM (see "Networking (v0.3)" below).
+# [task.network]
+# enabled = true
+# hostname = "web-1"   # optional; passed to the guest as bigtop.hostname
 ```
 
 `[[task]]` also deserializes from JSON as `"tasks": [...]`.
@@ -239,15 +246,98 @@ must log over vsock. `--daemonize` is off by default — the agent
 supervises the jailer process as the VM's lifetime handle, and a
 daemonizing jailer would look like an instantly-exited VM.
 
-**v0.2 limits (honest):** no tap networking (that's v0.3), no reference
-guest init yet, no server persistence. End-to-end microVM boot, real
-snapshot files, and the real vsock bridge are implemented against the
-real Firecracker API and unit-tested (config builders including
-`PUT /vsock`, frame codec over a loopback, the full accept/serve path
-over real `AF_UNIX` sockets, HTTP plumbing against fake API sockets),
-but **unverified on real KVM hardware** — this environment has no
-`/dev/kvm`. Only the guest side of the bridge needs `AF_VSOCK`; the
-agent side is `AF_UNIX` and fully exercised in tests.
+**v0.2 limits (honest):** no reference guest init yet, no server
+persistence. End-to-end microVM boot, real snapshot files, and the real
+vsock bridge are implemented against the real Firecracker API and
+unit-tested (config builders including `PUT /vsock`, frame codec over a
+loopback, the full accept/serve path over real `AF_UNIX` sockets, HTTP
+plumbing against fake API sockets), but **unverified on real KVM
+hardware** — this environment has no `/dev/kvm`. Only the guest side of
+the bridge needs `AF_VSOCK`; the agent side is `AF_UNIX` and fully
+exercised in tests.
+
+### Networking (v0.3)
+
+Every network-enabled task gets a tap device, a MAC, and a static IP.
+
+**Server IPAM.** `bigtop server --network-cidr 172.28.0.0/16` (the
+default) carves the /16 into /24s, one per node: the first node seen gets
+`172.28.0.0/24`, the next `172.28.1.0/24`, and so on. On placement, the
+scheduler allocates one IP per network-enabled task from its node's /24
+(`.1` is the gateway, `.2`–`.254` are guests; `.0`/`.255` are never handed
+out). The IP is released when the task goes terminal and when a dead
+node's tasks requeue — a requeued task gets a fresh IP on its next
+placement. Exhaustion is not an error: the task stays `Pending` until an
+address frees up. 253 usable IPs per node; the allocator refuses past 256
+nodes (a limit, not a target). `bigtop ps` shows the assigned IP.
+
+**Agent tap provisioning.** Before the VMM boots, the agent creates a tap
+named `bt-<8 hex chars of the task id>` (11 chars, inside the 15-char
+Linux interface limit) via `iproute2`, brings it up, and — when
+`--jailer --netns <path>` is set — moves it into that netns so the jailed
+Firecracker can see it. Tap creation needs `CAP_NET_ADMIN` (or root) and
+the `ip` binary; without them the task fails with a clear error instead
+of booting dark. The tap is destroyed after the task's terminal state is
+reported, and on every boot failure path — taps never linger.
+
+**Firecracker wiring.** On fresh boots the agent PUTs
+`/network-interfaces/eth0`
+(`{"iface_id": "eth0", "guest_mac": "<mac>", "host_dev_name": "<tap>"}`)
+right after the vsock device setup. The MAC is deterministic per task id
+(locally-administered unicast, `02:xx:…`), stable across retries. Tap
+name, MAC, and IP are also recorded in `bigtop-vm.json`. Snapshot boots
+do **not** reconfigure networking: the restored VM keeps the snapshot's
+device state (and its old IP — see limits).
+
+**v0.3 guest contract.** The guest gets static networking on the kernel
+cmdline, next to the existing `bigtop.*` parameters:
+
+```text
+ip=172.28.3.5::172.28.3.1:255.255.255.0::eth0:off bigtop.hostname=web-1
+```
+
+i.e. `ip=<addr>::<gateway>:<netmask>::eth0:off`, plus
+`bigtop.hostname=<hostname>` when the task spec sets one. The guest init
+parses `/proc/cmdline` and configures `eth0` itself; a minimal init
+fragment:
+
+```sh
+# static networking from the BigTop cmdline
+for kv in $(cat /proc/cmdline); do
+  case "$kv" in
+    ip=*)              IPCFG="${kv#ip=}" ;;
+    bigtop.hostname=*) HOSTNAME="${kv#bigtop.hostname=}" ;;
+  esac
+done
+ADDR="${IPCFG%%:*}"; REST="${IPCFG#*:*:}"; GW="${REST%%:*}"
+ip link set eth0 up
+ip addr add "$ADDR/24" dev eth0
+ip route add default via "$GW" dev eth0
+[ -n "${HOSTNAME:-}" ] && hostname "$HOSTNAME"
+```
+
+The guest sees its MAC on `eth0` automatically (virtio-net). DHCP is a
+deliberate non-goal for v0.3: static assignment is deterministic, needs no
+guest DHCP client, and keeps the orchestrator's IPAM the single source of
+truth.
+
+**Host plumbing.** The operator runs `scripts/setup-nat.sh` once per node
+(as root): it enables IPv4 forwarding and installs an nftables masquerade
+for the pod CIDR so guests can reach the outside world. The agent never
+mutates host firewall rules itself — explicit operator action only.
+Requirements recap: `/dev/kvm`, `CAP_NET_ADMIN` (or root) + `iproute2`
+for the agent, nftables for NAT, and (for jailer mode) the v0.2 chroot
+setup plus `/dev/net/tun` inside the jail.
+
+**v0.3 limits (honest):** pod IPs are node-local — there is no cross-node
+overlay yet, so a guest on node A cannot reach a guest on node B by pod
+IP (that's the v0.4 sketch). A snapshot-restored task keeps the
+snapshot's guest IP even though the scheduler assigns a new one; the
+guest must tolerate that or re-read its cmdline on boot. No reference
+guest init ships yet; DHCP is out of scope. Real tap creation, the real
+`PUT /network-interfaces` round-trip, and packet flow are implemented
+against the real Firecracker API and unit-tested but **unverified on real
+KVM hardware** — this environment has no `/dev/kvm` or `CAP_NET_ADMIN`.
 
 ### ProcessRuntime (dev/CI stand-in)
 
@@ -274,7 +364,7 @@ Unique per process; sortable; safe in env vars and shell.
 ## CLI
 
 ```
-bigtop server [--port 4667] [--bind 127.0.0.1]
+bigtop server [--port 4667] [--bind 127.0.0.1] [--network-cidr 172.28.0.0/16]
 bigtop agent --server http://127.0.0.1:4667 [--name NAME] [--runtime auto] [--vm-dir DIR] [--firecracker-bin BIN] [--jailer] [--jailer-bin BIN] [--jailer-uid UID] [--jailer-gid GID] [--chroot-base-dir DIR] [--netns PATH]
 bigtop run <job.toml> [--server URL]
 bigtop ps [--server URL]

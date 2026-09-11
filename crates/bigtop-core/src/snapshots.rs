@@ -210,10 +210,12 @@ mod tests {
                 vm: VmSpec::default(),
                 node_affinity: None,
                 snapshot_policy: SnapshotPolicy::None,
+                network: crate::network::NetworkSpec::default(),
             },
             state: TaskState::Running,
             assigned_node: Some(NodeId::from("node-9".to_string())),
             exit_code: None,
+            network: None,
         };
         let record = SnapshotRecord {
             id: SnapshotId::from("snap-1".to_string()),

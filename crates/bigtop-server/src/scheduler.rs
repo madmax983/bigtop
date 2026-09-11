@@ -10,8 +10,9 @@
 //!    that still fits it (least-loaded fit), ties broken by node id for
 //!    determinism.
 
+use crate::ipam::Ipam;
 use crate::state::StateInner;
-use bigtop_core::{NodeId, NodeInfo, Resources, Task, TaskId, TaskState};
+use bigtop_core::{NetworkAssignment, NodeId, NodeInfo, Resources, Task, TaskId, TaskState};
 use chrono::{DateTime, Utc};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -43,6 +44,9 @@ fn requeue_dead_nodes(inner: &mut StateInner, now: DateTime<Utc>) {
         if orphaned {
             task.state = TaskState::Pending;
             task.assigned_node = None;
+            // The dead node's subnet is gone: free the IP and the assignment.
+            let _ = inner.ipam.release(&task.id);
+            task.network = None;
         }
     }
 }
@@ -83,18 +87,38 @@ fn place_pending(inner: &mut StateInner, now: DateTime<Utc>) {
             Some(task) => task.clone(),
             None => continue,
         };
-        if let Some(node_id) = pick_node(inner, &task, now) {
-            let placed = match (inner.tasks.get_mut(&task_id), inner.nodes.get_mut(&node_id)) {
-                (Some(task), Some(node)) => {
-                    task.state = TaskState::Assigned;
-                    task.assigned_node = Some(node.id.clone());
-                    node.used = node.used.saturating_add(task.spec.resources);
-                    true
-                }
-                _ => false,
+        let Some(node_id) = pick_node(inner, &task, now) else {
+            continue;
+        };
+        // Network-enabled tasks get an IP on the chosen node's /24. When
+        // the address space is exhausted the task stays Pending for a
+        // later tick.
+        let network = if task.spec.network.enabled {
+            let Some(ip) = inner.ipam.allocate(&node_id, &task_id) else {
+                continue;
             };
-            let _ = placed;
-        }
+            let Some(gateway) = inner.ipam.gateway_for(&node_id) else {
+                continue;
+            };
+            Some(NetworkAssignment {
+                ip,
+                gateway,
+                netmask: Ipam::netmask(),
+            })
+        } else {
+            None
+        };
+        let placed = match (inner.tasks.get_mut(&task_id), inner.nodes.get_mut(&node_id)) {
+            (Some(task), Some(node)) => {
+                task.state = TaskState::Assigned;
+                task.assigned_node = Some(node.id.clone());
+                task.network = network;
+                node.used = node.used.saturating_add(task.spec.resources);
+                true
+            }
+            _ => false,
+        };
+        let _ = placed;
     }
 }
 
@@ -139,7 +163,7 @@ fn cmp_load(a: &NodeInfo, b: &NodeInfo) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bigtop_core::{JobId, NodeId, SnapshotPolicy, Task, TaskSpec, VmSpec};
+    use bigtop_core::{JobId, NetworkSpec, NodeId, SnapshotPolicy, Task, TaskSpec, VmSpec};
     use std::collections::HashMap;
 
     fn node(id: &str, cpu: u64, mem: u64, now: DateTime<Utc>) -> NodeInfo {
@@ -181,10 +205,12 @@ mod tests {
                 },
                 node_affinity: None,
                 snapshot_policy: SnapshotPolicy::None,
+                network: NetworkSpec::default(),
             },
             state: TaskState::Pending,
             assigned_node: None,
             exit_code: None,
+            network: None,
         }
     }
 
@@ -348,6 +374,118 @@ mod tests {
             .expect("orphan");
         assert_eq!(orphan.state, TaskState::Pending);
         assert_eq!(orphan.assigned_node, None);
+    }
+
+    #[test]
+    fn network_task_gets_assignment_in_node_subnet() {
+        let now = Utc::now();
+        let mut inner = cluster(now);
+        let mut t = task("task-net", 100, 64);
+        t.spec.network.enabled = true;
+        inner.tasks.insert(t.id.clone(), t);
+        tick(&mut inner, now);
+        let placed = inner
+            .tasks
+            .get(&TaskId::from("task-net".to_string()))
+            .expect("task");
+        assert_eq!(placed.state, TaskState::Assigned);
+        let node_id = placed.assigned_node.clone().expect("placed on a node");
+        let assignment = placed.network.expect("network assignment");
+        assert_eq!(assignment.netmask, Ipam::netmask());
+        let subnet = inner.ipam.subnet_for(&node_id).expect("node subnet");
+        let octets = assignment.ip.octets();
+        assert_eq!(&octets[0..3], &subnet.octets()[0..3]);
+        assert!((2..=254).contains(&octets[3]));
+        assert_eq!(
+            assignment.gateway,
+            inner.ipam.gateway_for(&node_id).expect("gateway")
+        );
+        assert_eq!(inner.ipam.assigned(&placed.id), Some(assignment.ip));
+    }
+
+    #[test]
+    fn network_disabled_task_gets_no_assignment() {
+        let now = Utc::now();
+        let mut inner = cluster(now);
+        let t = task("task-plain", 100, 64);
+        inner.tasks.insert(t.id.clone(), t);
+        tick(&mut inner, now);
+        let placed = inner
+            .tasks
+            .get(&TaskId::from("task-plain".to_string()))
+            .expect("task");
+        assert_eq!(placed.state, TaskState::Assigned);
+        assert_eq!(placed.network, None);
+        assert_eq!(inner.ipam.assigned(&placed.id), None);
+    }
+
+    #[test]
+    fn dead_node_requeue_releases_ip_and_clears_assignment() {
+        let now = Utc::now();
+        let mut inner = StateInner::default();
+        inner.nodes.insert(
+            NodeId::from("node-old".to_string()),
+            node("node-old", 4000, 4096, now - chrono::Duration::seconds(30)),
+        );
+        let node_id = NodeId::from("node-old".to_string());
+        let mut t = task("task-orphan", 100, 64);
+        t.spec.network.enabled = true;
+        t.state = TaskState::Assigned;
+        t.assigned_node = Some(node_id.clone());
+        let ip = inner
+            .ipam
+            .allocate(&node_id, &t.id)
+            .expect("pre-allocation");
+        t.network = Some(NetworkAssignment {
+            ip,
+            gateway: inner.ipam.gateway_for(&node_id).expect("gateway"),
+            netmask: Ipam::netmask(),
+        });
+        inner.tasks.insert(t.id.clone(), t);
+
+        tick(&mut inner, now);
+
+        let orphan = inner
+            .tasks
+            .get(&TaskId::from("task-orphan".to_string()))
+            .expect("orphan");
+        // No live capacity: stays Pending with the IP freed and cleared.
+        assert_eq!(orphan.state, TaskState::Pending);
+        assert_eq!(orphan.assigned_node, None);
+        assert_eq!(orphan.network, None);
+        assert_eq!(inner.ipam.assigned(&orphan.id), None);
+    }
+
+    #[test]
+    fn exhausted_subnet_leaves_network_task_pending() {
+        let now = Utc::now();
+        let mut inner = StateInner::default();
+        let node_id = NodeId::from("node-solo".to_string());
+        inner
+            .nodes
+            .insert(node_id.clone(), node("node-solo", 4000, 4096, now));
+        // Fill the node's entire /24 through the IPAM directly.
+        for i in 0..253 {
+            let filler = TaskId::from(format!("filler-{i}"));
+            assert!(
+                inner.ipam.allocate(&node_id, &filler).is_some(),
+                "filler {i} must fit"
+            );
+        }
+        let mut t = task("task-starved", 100, 64);
+        t.spec.network.enabled = true;
+        inner.tasks.insert(t.id.clone(), t);
+
+        tick(&mut inner, now);
+
+        let starved = inner
+            .tasks
+            .get(&TaskId::from("task-starved".to_string()))
+            .expect("task");
+        assert_eq!(starved.state, TaskState::Pending);
+        assert_eq!(starved.assigned_node, None);
+        assert_eq!(starved.network, None);
+        assert_eq!(inner.ipam.assigned(&starved.id), None);
     }
 
     #[test]

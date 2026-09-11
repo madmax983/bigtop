@@ -25,12 +25,16 @@
 use crate::jailer::{JailerConfig, JailerOptions, JAILED_API_SOCK, JAILED_LOG_PATH};
 use crate::runtime::{RunningTask, Runtime};
 use crate::snapshot::{resolve_snapshot_paths, SnapshotManager};
+use crate::tap::TapDevice;
 use crate::vsock::{serve_vsock_logs, VsockLogHub, VSOCK_LOG_PORT};
 use crate::AgentError;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use bigtop_core::{SnapshotId, SnapshotLoadSpec, SnapshotSpec, Task, TaskId};
+use bigtop_core::{
+    mac_for_task, tap_name_for, MacAddr, SnapshotId, SnapshotLoadSpec, SnapshotSpec, Task, TaskId,
+};
 use serde_json::json;
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -168,6 +172,37 @@ impl FirecrackerRuntime {
         PathBuf::from(path)
     }
 
+    /// Create and bring up the host TAP device for a networked task.
+    ///
+    /// Returns `None` when the task's `[network]` is disabled. In jailer
+    /// mode the TAP moves into the jail's netns so the VMM can attach it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Network`] when networking is enabled but the
+    /// server assigned no IP, or when any `ip` call fails.
+    async fn setup_tap(&self, task: &Task) -> Result<Option<TapDevice>, AgentError> {
+        if !task.spec.network.enabled {
+            return Ok(None);
+        }
+        if task.network.is_none() {
+            return Err(AgentError::Network(
+                "task has networking enabled but the server assigned no IP".to_string(),
+            ));
+        }
+        let tap = TapDevice::create(&tap_name_for(&task.id)).await?;
+        tap.set_up().await?;
+        if let Some(netns) = self
+            .config
+            .jailer
+            .as_ref()
+            .and_then(|opts| opts.netns.as_ref())
+        {
+            tap.move_to_netns(netns).await?;
+        }
+        Ok(Some(tap))
+    }
+
     /// Take a snapshot of `task_id`'s running microVM per `spec`.
     ///
     /// Resolves default paths, creates the snapshot directory, and calls
@@ -234,6 +269,22 @@ impl FirecrackerRuntime {
                 sock,
                 "/vsock",
                 &vsock_device_body(guest_cid_for(&task.id), &self.vsock_device_path(&task.id)),
+            )
+            .await?;
+        }
+        if task.spec.network.enabled {
+            // The interface body carries no addresses, but a task with
+            // networking enabled and no server assignment is a server bug:
+            // fail here, before the guest boots with no IP to configure.
+            let Some(_assign) = task.network else {
+                return Err(AgentError::Network(
+                    "task has networking enabled but the server assigned no IP".to_string(),
+                ));
+            };
+            fc_put(
+                sock,
+                "/network-interfaces/eth0",
+                &network_interface_body("eth0", &mac_for_task(&task.id), &tap_name_for(&task.id)),
             )
             .await?;
         }
@@ -374,46 +425,67 @@ impl Runtime for FirecrackerRuntime {
                 .await
                 .map_err(AgentError::Io)?;
         }
+        // Guest networking: create the host TAP before the VMM boots so the
+        // `PUT /network-interfaces/eth0` in `configure` has a device to
+        // attach. `execute_task` destroys the TAP after the terminal state;
+        // any boot failure below destroys it too, so no path leaks a tap.
+        let tap = self.setup_tap(task).await?;
         // Render the exact values the REST calls will use, and record them
         // in bigtop-vm.json before the VMM boots.
         let vcpu_count = vcpu_for(task.spec.resources.cpu_millis, vm.vcpu_count);
         let mem_mb = vm.mem_mb.max(64);
         let args = boot_args(vm.boot_args.as_deref(), task);
-        let (mut child, jailer_argv) = self.spawn_vmm(task, &api_sock)?;
-        let record = serde_json::to_string_pretty(&launch_record(
-            task,
-            boot,
-            vcpu_count,
-            mem_mb,
-            &args,
-            &api_sock,
-            jailer_argv.as_deref(),
-        ))
-        .map_err(AgentError::Json)?;
-        tokio::fs::write(vm_task_dir.join("bigtop-vm.json"), record)
-            .await
-            .map_err(AgentError::Io)?;
-        wait_for_socket(&api_sock, self.config.boot_timeout).await?;
-        // Bind the per-task vsock listener before the guest can dial: the
-        // guest connects to (CID 2, VSOCK_LOG_PORT) and Firecracker pairs it
-        // with the AF_UNIX socket at <uds_path>_<port>.
-        let vsock_stop = self.start_vsock_server(&task.id).await?;
-        let booted = match &boot {
-            BootKind::Fresh => {
-                self.configure(&api_sock, task, vcpu_count, mem_mb, &args)
-                    .await
+        let launched = async {
+            let (mut child, jailer_argv) = self.spawn_vmm(task, &api_sock)?;
+            let record = serde_json::to_string_pretty(&launch_record(
+                task,
+                boot,
+                vcpu_count,
+                mem_mb,
+                &args,
+                &api_sock,
+                jailer_argv.as_deref(),
+            ))
+            .map_err(AgentError::Json)?;
+            tokio::fs::write(vm_task_dir.join("bigtop-vm.json"), record)
+                .await
+                .map_err(AgentError::Io)?;
+            wait_for_socket(&api_sock, self.config.boot_timeout).await?;
+            // Bind the per-task vsock listener before the guest can dial: the
+            // guest connects to (CID 2, VSOCK_LOG_PORT) and Firecracker pairs it
+            // with the AF_UNIX socket at <uds_path>_<port>.
+            let vsock_stop = self.start_vsock_server(&task.id).await?;
+            let booted = match &boot {
+                BootKind::Fresh => {
+                    self.configure(&api_sock, task, vcpu_count, mem_mb, &args)
+                        .await
+                }
+                BootKind::Snapshot(load) => SnapshotManager::load(&api_sock, load).await,
+            };
+            if let Err(e) = booted {
+                let _ = child.kill().await;
+                return Err(e);
             }
-            BootKind::Snapshot(load) => SnapshotManager::load(&api_sock, load).await,
-        };
-        if let Err(e) = booted {
-            let _ = child.kill().await;
-            return Err(e);
+            Ok::<_, AgentError>((child, vsock_stop))
         }
+        .await;
+        let (child, vsock_stop) = match launched {
+            Ok(ok) => ok,
+            Err(e) => {
+                if let Some(tap) = tap {
+                    if let Err(te) = tap.destroy().await {
+                        eprintln!("bigtop agent: tap destroy failed: {te}");
+                    }
+                }
+                return Err(e);
+            }
+        };
         Ok(RunningTask {
             task_id: task.id.clone(),
             child,
             vm_dir: Some(vm_task_dir),
             vsock_stop,
+            tap,
         })
     }
 }
@@ -471,6 +543,43 @@ pub fn vsock_device_body(guest_cid: u32, uds_path: &Path) -> serde_json::Value {
     json!({ "guest_cid": guest_cid, "uds_path": uds_path })
 }
 
+/// `PUT /network-interfaces/<iface_id>` body: attach the host TAP device
+/// as the guest's network interface, with a deterministic MAC.
+///
+/// Takes the MAC by reference per the v0.3 agent/core contract (the
+/// sibling's `MacAddr` is `Copy`, so this is stylistic, not a cost).
+#[must_use]
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub fn network_interface_body(
+    iface_id: &str,
+    guest_mac: &MacAddr,
+    host_dev_name: &str,
+) -> serde_json::Value {
+    json!({
+        "iface_id": iface_id,
+        "guest_mac": guest_mac.to_string(),
+        "host_dev_name": host_dev_name,
+    })
+}
+
+/// Static guest IP configuration for the kernel cmdline, in the kernel's
+/// `ip=` syntax: `ip=<client-ip>:<server-ip>:<gw-ip>:<netmask>:<hostname>:
+/// <device>:<autoconf>`. The guest init parses this (plus
+/// `bigtop.hostname=`) to configure `eth0`.
+#[must_use]
+pub fn network_boot_args(
+    ip: Ipv4Addr,
+    gateway: Ipv4Addr,
+    netmask: Ipv4Addr,
+    hostname: Option<&str>,
+) -> String {
+    let base = format!("ip={ip}::{gateway}:{netmask}::eth0:off");
+    match hostname {
+        Some(name) => format!("{base} bigtop.hostname={name}"),
+        None => base,
+    }
+}
+
 /// Deterministic guest CID for `task_id`, in `3..=u32::MAX - 1`
 /// (`0`/`1`/`2` and `u32::MAX` are reserved). Derived from the task id so
 /// a retried task keeps its CID across agent restarts.
@@ -525,6 +634,17 @@ pub fn launch_record(
     if let Some(argv) = jailer_argv {
         record["jailer_argv"] = json!(argv);
     }
+    if task.spec.network.enabled {
+        if let Some(assign) = &task.network {
+            record["network"] = json!({
+                "iface_id": "eth0",
+                "guest_mac": mac_for_task(&task.id).to_string(),
+                "tap_name": tap_name_for(&task.id),
+                "ip": assign.ip.to_string(),
+                "gateway": assign.gateway.to_string(),
+            });
+        }
+    }
     record
 }
 
@@ -554,6 +674,10 @@ fn shell_quote(word: &str) -> String {
 /// v0.1 guest contract: the guest init reads `/proc/cmdline`, decodes
 /// `bigtop.cmd_b64` (base64 of the shell line from [`shell_join`]), and
 /// execs it. `bigtop.task` carries the task id for the guest's own logging.
+///
+/// When the task's `[network]` is enabled and the server assigned an IP,
+/// the static guest configuration from [`network_boot_args`] is appended
+/// so the guest init can bring up `eth0`.
 #[must_use]
 pub fn boot_args(base: Option<&str>, task: &Task) -> String {
     let cmd_b64 = STANDARD.encode(shell_join(
@@ -564,10 +688,22 @@ pub fn boot_args(base: Option<&str>, task: &Task) -> String {
     let base_args = base
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("console=ttyS0 reboot=k panic=1 pci=off");
-    format!(
+    let mut args = format!(
         "{base_args} bigtop.task={} bigtop.cmd_b64={cmd_b64}",
         task.id
-    )
+    );
+    if task.spec.network.enabled {
+        if let Some(assign) = &task.network {
+            args.push(' ');
+            args.push_str(&network_boot_args(
+                assign.ip,
+                assign.gateway,
+                assign.netmask,
+                task.spec.network.hostname.as_deref(),
+            ));
+        }
+    }
+    args
 }
 
 /// Wait until the VMM's API socket appears.
@@ -645,9 +781,11 @@ fn parse_status(response: &[u8]) -> (u16, String) {
 mod tests {
     use super::*;
     use bigtop_core::{
-        JobId, Resources, SnapshotLoadSpec, SnapshotPolicy, TaskSpec, TaskState, VmSpec,
+        JobId, NetworkAssignment, NetworkSpec, Resources, SnapshotLoadSpec, SnapshotPolicy,
+        TaskSpec, TaskState, VmSpec,
     };
     use std::collections::HashMap;
+    use std::net::Ipv4Addr;
 
     fn test_task() -> Task {
         Task {
@@ -674,11 +812,29 @@ mod tests {
                 },
                 node_affinity: None,
                 snapshot_policy: SnapshotPolicy::None,
+                network: NetworkSpec {
+                    enabled: false,
+                    hostname: None,
+                },
             },
             state: TaskState::Pending,
             assigned_node: None,
             exit_code: None,
+            network: None,
         }
+    }
+
+    /// A task with `[network]` enabled and a server-assigned IP.
+    fn networked_task() -> Task {
+        let mut task = test_task();
+        task.spec.network.enabled = true;
+        task.spec.network.hostname = Some("web-1".to_string());
+        task.network = Some(NetworkAssignment {
+            ip: Ipv4Addr::new(10, 0, 0, 2),
+            gateway: Ipv4Addr::new(10, 0, 0, 1),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+        });
+        task
     }
 
     #[test]
@@ -754,6 +910,63 @@ mod tests {
     }
 
     #[test]
+    fn network_boot_args_exact_shape() {
+        let ip = Ipv4Addr::new(10, 0, 0, 2);
+        let gw = Ipv4Addr::new(10, 0, 0, 1);
+        let mask = Ipv4Addr::new(255, 255, 255, 0);
+        assert_eq!(
+            network_boot_args(ip, gw, mask, None),
+            "ip=10.0.0.2::10.0.0.1:255.255.255.0::eth0:off"
+        );
+        assert_eq!(
+            network_boot_args(ip, gw, mask, Some("web-1")),
+            "ip=10.0.0.2::10.0.0.1:255.255.255.0::eth0:off bigtop.hostname=web-1"
+        );
+    }
+
+    #[test]
+    fn boot_args_appends_network_when_enabled_and_assigned() {
+        let task = networked_task();
+        let args = boot_args(None, &task);
+        assert!(
+            args.contains("ip=10.0.0.2::10.0.0.1:255.255.255.0::eth0:off"),
+            "{args}"
+        );
+        assert!(args.contains("bigtop.hostname=web-1"), "{args}");
+    }
+
+    #[test]
+    fn boot_args_omits_network_when_disabled() {
+        let task = test_task();
+        assert!(!task.spec.network.enabled);
+        let args = boot_args(None, &task);
+        assert!(!args.contains("::eth0:off"), "{args}");
+        assert!(!args.contains("bigtop.hostname"), "{args}");
+    }
+
+    #[test]
+    fn boot_args_omits_network_without_assignment() {
+        // Enabled but the server assigned no IP: nothing to configure.
+        let mut task = test_task();
+        task.spec.network.enabled = true;
+        let args = boot_args(None, &task);
+        assert!(!args.contains("::eth0:off"), "{args}");
+        assert!(!args.contains("bigtop.hostname"), "{args}");
+    }
+
+    #[test]
+    fn network_interface_body_exact_shape() {
+        let mac = mac_for_task(&TaskId::from("task-abc".to_string()));
+        let body = network_interface_body("eth0", &mac, "tap-bt-abc");
+        assert_eq!(body["iface_id"], "eth0");
+        assert_eq!(body["guest_mac"], mac.to_string());
+        assert_eq!(body["host_dev_name"], "tap-bt-abc");
+        // Exact shape: nothing else.
+        let object = body.as_object().expect("object body");
+        assert_eq!(object.len(), 3, "{object:?}");
+    }
+
+    #[test]
     fn launch_config_mirrors_api_bodies() {
         let task = test_task();
         let vcpu = vcpu_for(task.spec.resources.cpu_millis, task.spec.vm.vcpu_count);
@@ -782,6 +995,8 @@ mod tests {
         assert_eq!(cfg["api_socket"], "/tmp/vm/fc.sock");
         assert_eq!(cfg["boot"], "fresh");
         assert!(cfg.get("jailer_argv").is_none());
+        // No `[network]`: no network block.
+        assert!(cfg.get("network").is_none());
         // Serializes cleanly, which is what the agent writes to disk.
         let text = serde_json::to_string_pretty(&cfg).expect("serialize");
         let back: serde_json::Value = serde_json::from_str(&text).expect("deserialize");
@@ -828,6 +1043,28 @@ mod tests {
             Some(&argv),
         );
         assert_eq!(cfg["jailer_argv"], json!(argv));
+    }
+
+    #[test]
+    fn launch_record_includes_network_when_enabled() {
+        let task = networked_task();
+        let cfg = launch_record(
+            &task,
+            BootKind::Fresh,
+            1,
+            128,
+            "console=ttyS0",
+            Path::new("/tmp/vm/fc.sock"),
+            None,
+        );
+        assert_eq!(cfg["network"]["iface_id"], "eth0");
+        assert_eq!(
+            cfg["network"]["guest_mac"],
+            mac_for_task(&task.id).to_string()
+        );
+        assert_eq!(cfg["network"]["tap_name"], tap_name_for(&task.id));
+        assert_eq!(cfg["network"]["ip"], "10.0.0.2");
+        assert_eq!(cfg["network"]["gateway"], "10.0.0.1");
     }
 
     #[test]

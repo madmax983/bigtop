@@ -87,8 +87,9 @@ runtime — same scheduling, same logs, no virtualization.
   are **unverified**: they need `/dev/kvm` and a guest kernel/rootfs,
   which this dev environment doesn't have. The live demo runs on the
   process runtime.
-- ⚠️ No reference guest init yet, no tap networking, no persistence
-  (server state is in-memory).
+- ⚠️ No reference guest init yet, no server persistence (state is
+  in-memory), and no cross-node pod routing (v0.3 pod IPs are node-local;
+  see SPEC.md "Networking (v0.3)" limits).
 
 ## Jailer host setup
 
@@ -124,15 +125,57 @@ the jailed `/vsock.sock` (no host setup needed — Firecracker creates it);
 the agent listens for guest logs at the host path
 `<chroot-base>/<id>/root/vsock.sock_4668`.
 
+## Networking host setup (v0.3)
+
+Three things, all explicit operator actions — the agent never touches
+host firewall rules on its own:
+
+```bash
+# 1. One-time NAT per node (as root): IPv4 forwarding + nftables
+#    masquerade for the pod CIDR, so guests can reach the outside world.
+sudo ./scripts/setup-nat.sh
+#    Override the CIDR with BIGTOP_POD_CIDR=10.42.0.0/16 (must match
+#    `bigtop server --network-cidr`).
+
+# 2. The agent needs CAP_NET_ADMIN (or root) plus iproute2 to create tap
+#    devices. Without them, network-enabled tasks fail with a clear
+#    error instead of booting dark:
+sudo setcap cap_net_admin+ep $(which bigtop)   # or just run the agent as root
+
+# 3. For jailer mode, /dev/net/tun must exist inside the jail
+#    (already in the v0.2 chroot checklist above).
+```
+
+`bigtop server --network-cidr 172.28.0.0/16` (the default) carves the
+/16 into /24s, one per node; the scheduler hands each network-enabled
+task one static IP (`.2`–`.254`, `.1` is the gateway). Enable it per
+task in the job TOML — see `examples/network.toml`:
+
+```toml
+[task.network]
+enabled = true
+hostname = "web-1"
+```
+
+The guest configures `eth0` from the kernel cmdline
+(`ip=<addr>::<gateway>:<netmask>::eth0:off`); the full guest-side
+contract, including a minimal init snippet, is in SPEC.md
+"Networking (v0.3)". DHCP is a deliberate non-goal: static assignment
+keeps the server's IPAM the single source of truth.
+
 ## Roadmap
 
 - **v0.2** — ✅ Done: snapshot/restore, vsock log streaming, jailer
   sandboxing. (Deferred: reference guest init, server persistence.)
-- **v0.3** — Networking: tap devices + CNI-lite, per-task IPs, `--netns`
-  wiring for jailer mode; reference guest init honoring `bigtop.cmd_b64`
-  and the vsock log contract.
-- **v0.4** — Service discovery + virtual IPs, web dashboard, server
-  persistence.
+- **v0.3** — ✅ Done: networking — tap provisioning per task,
+  `PUT /network-interfaces` wiring, server IPAM (`/16` → `/24` per node,
+  one static IP per task), kernel-cmdline guest contract, `setup-nat.sh`
+  host plumbing. (Deferred: reference guest init, server persistence,
+  cross-node pod routing.)
+- **v0.4** — Cross-node overlay (VXLAN mesh so pod IPs are routable
+  cluster-wide — the natural sequel to v0.3's node-local `/24`s),
+  service discovery + virtual IPs, per-task network counters/metrics
+  endpoint, web dashboard, server persistence.
 
 ## Profiling
 

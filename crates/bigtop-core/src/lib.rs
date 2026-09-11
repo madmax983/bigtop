@@ -6,6 +6,7 @@
 pub mod api;
 pub mod error;
 pub mod ids;
+pub mod network;
 pub mod snapshots;
 pub mod types;
 
@@ -16,6 +17,7 @@ pub use api::{
 };
 pub use error::Error;
 pub use ids::{JobId, NodeId, SnapshotId, TaskId};
+pub use network::{mac_for_task, tap_name_for, MacAddr, NetworkAssignment, NetworkSpec};
 pub use snapshots::{
     SnapshotLoadSpec, SnapshotPolicy, SnapshotRecord, SnapshotSpec, SnapshotState, SnapshotType,
 };

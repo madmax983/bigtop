@@ -1,0 +1,21 @@
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: bash -c 'export PATH="$HOME/.cargo/bin:$PATH"; cargo fmt --all'
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: cargo-clippy-strict
+        name: cargo clippy (pedantic + nursery)
+        entry: bash -c 'export PATH="$HOME/.cargo/bin:$PATH"; cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery'
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: cargo-test
+        name: cargo test
+        entry: bash -c 'export PATH="$HOME/.cargo/bin:$PATH"; cargo test --workspace'
+        language: system
+        pass_filenames: false
+        always_run: true

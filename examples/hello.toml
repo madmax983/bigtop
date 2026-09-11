@@ -1,0 +1,24 @@
+# BigTop example job: three greeters, each in its own microVM.
+#
+# The [task.vm] section describes the guest. On real KVM hardware the agent
+# boots one Firecracker microVM per task; without /dev/kvm it falls back to
+# plain processes (same scheduling, same logs).
+name = "hello"
+
+[[task]]
+name = "greeter"
+command = "sh"
+args = ["-c", "echo hello from $BIGTOP_TASK; sleep 30"]
+count = 3
+
+[task.resources]
+cpu_millis = 100
+mem_mb = 64
+
+[task.vm]
+kernel_image = "/var/lib/bigtop/images/vmlinux"
+rootfs = "/var/lib/bigtop/images/rootfs.ext4"
+vcpu_count = 1
+mem_mb = 128
+# boot_args is optional; BigTop appends bigtop.task=<id> and
+# bigtop.cmd_b64=<base64 shell line> for the guest init.

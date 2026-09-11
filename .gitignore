@@ -1,0 +1,7 @@
+target/
+*.log
+profiling/callgrind.out*
+profiling/dhat.log*
+profiling/dh_view.html
+bigtop-vms/
+.DS_Store

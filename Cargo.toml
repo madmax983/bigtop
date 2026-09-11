@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bigtop-core",
+    "crates/bigtop-server",
+    "crates/bigtop-agent",
+    "crates/bigtop",
+]

@@ -1,0 +1,55 @@
+# BigTop v0.4 example: service discovery over the task network.
+#
+# The "db" task registers its pod IP under the "db" service while it runs;
+# the "api" tasks discover it and get BIGTOP_SERVICES injected at schedule
+# time, e.g. {"db":["172.28.0.2"],"cache":[]}. `bigtop services` shows the
+# live registry. In process mode (no KVM) the tasks are plain processes,
+# but the registry, env injection, and the CLI all work the same.
+name = "svc-demo"
+
+[[task]]
+name = "db"
+command = "sh"
+args = ["-c", "echo db up; sleep 60"]
+count = 1
+
+[task.network]
+enabled = true
+hostname = "db"
+
+[task.service]
+name = "db"
+
+[task.resources]
+cpu_millis = 100
+mem_mb = 64
+
+[task.vm]
+kernel_image = "/var/lib/bigtop/images/vmlinux"
+rootfs = "/var/lib/bigtop/images/rootfs.ext4"
+vcpu_count = 1
+mem_mb = 128
+
+[[task]]
+name = "api"
+command = "sh"
+args = ["-c", "echo services: $BIGTOP_SERVICES; sleep 60"]
+count = 2
+
+[task.network]
+enabled = true
+hostname = "api"
+
+[task.service]
+name = "api"
+discover = ["db", "cache"]
+
+[task.resources]
+cpu_millis = 100
+mem_mb = 64
+
+[task.vm]
+kernel_image = "/var/lib/bigtop/images/vmlinux"
+rootfs = "/var/lib/bigtop/images/rootfs.ext4"
+vcpu_count = 1
+mem_mb = 128

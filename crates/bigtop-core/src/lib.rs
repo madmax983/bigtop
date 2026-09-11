@@ -11,13 +11,16 @@ pub mod snapshots;
 pub mod types;
 
 pub use api::{
-    JobSummary, LogLinesResponse, PendingSnapshot, PushLogsRequest, RegisterNodeRequest,
-    RegisterNodeResponse, ReportSnapshotResult, RequestSnapshotRequest, RequestSnapshotResponse,
-    SetTaskStateRequest, SubmitJobResponse,
+    HeartbeatRequest, JobSummary, LogLinesResponse, OverlayPeer, PendingSnapshot, PushLogsRequest,
+    RegisterNodeRequest, RegisterNodeResponse, ReportSnapshotResult, RequestSnapshotRequest,
+    RequestSnapshotResponse, ServiceEndpoint, ServiceInfo, SetTaskStateRequest, SubmitJobResponse,
 };
 pub use error::Error;
 pub use ids::{JobId, NodeId, SnapshotId, TaskId};
-pub use network::{mac_for_task, tap_name_for, MacAddr, NetworkAssignment, NetworkSpec};
+pub use network::{
+    mac_for_str, mac_for_task, tap_name_for, vtep_mac_for_node, MacAddr, NetworkAssignment,
+    NetworkSpec, ServiceSpec,
+};
 pub use snapshots::{
     SnapshotLoadSpec, SnapshotPolicy, SnapshotRecord, SnapshotSpec, SnapshotState, SnapshotType,
 };

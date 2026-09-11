@@ -6,6 +6,7 @@
 //! `.255` (broadcast) addresses of every `/24` are never handed out.
 
 use bigtop_core::{NodeId, TaskId};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
@@ -23,7 +24,7 @@ pub enum IpamError {
 }
 
 /// IPAM over one `/16`: one `/24` per node, one host address per task.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ipam {
     /// First two octets of the `/16`.
     base: [u8; 2],
@@ -111,6 +112,19 @@ impl Ipam {
     #[must_use]
     pub fn assigned(&self, task_id: &TaskId) -> Option<Ipv4Addr> {
         self.allocated.get(task_id).copied()
+    }
+
+    /// Number of addresses currently handed out.
+    #[must_use]
+    pub fn allocated_count(&self) -> usize {
+        self.allocated.len()
+    }
+
+    /// Total addresses the `/16` can hand out: 256 `/24`s x 253 host
+    /// addresses each (`.0`, `.1`, `.255` are reserved).
+    #[must_use]
+    pub const fn capacity() -> usize {
+        256 * (LAST_HOST - FIRST_HOST + 1) as usize
     }
 
     /// Third octet for `node_id`, assigning the next free one on first use.

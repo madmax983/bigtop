@@ -8,6 +8,7 @@ use crate::types::Resources;
 use crate::types::TaskState;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
 
 /// `POST /v1/nodes/register` body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +19,20 @@ pub struct RegisterNodeRequest {
     pub addr: String,
     /// Total resources the node offers.
     pub total: Resources,
+    /// Underlay IP for the VXLAN overlay (v0.4). `None` when the agent
+    /// does not participate in the overlay.
+    #[serde(default)]
+    pub underlay_ip: Option<Ipv4Addr>,
+}
+
+/// Heartbeat body. Every field is optional so a bare `POST` (empty body)
+/// keeps working; fields present are refreshed on the node record.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HeartbeatRequest {
+    /// Underlay IP for the VXLAN overlay (v0.4). Refreshes the address
+    /// the node registered with, if the agent's has changed.
+    #[serde(default)]
+    pub underlay_ip: Option<Ipv4Addr>,
 }
 
 /// `POST /v1/nodes/register` response.
@@ -120,4 +135,35 @@ pub struct ReportSnapshotResult {
     /// Failure detail (set on `Failed`).
     #[serde(default)]
     pub error: Option<String>,
+}
+
+/// `GET /v1/agents/overlay-peers` row: another node in the VXLAN mesh.
+///
+/// The agent builds static FDB entries from these: each peer's VTEP MAC
+/// is [`vtep_mac_for_node`](crate::network::vtep_mac_for_node) of its id,
+/// reachable at its underlay IP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverlayPeer {
+    /// The peer node's id.
+    pub node_id: NodeId,
+    /// The peer node's underlay (VTEP) IP.
+    pub underlay_ip: Ipv4Addr,
+}
+
+/// One reachable endpoint of a service: a `Running` task's pod IP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceEndpoint {
+    /// The serving task.
+    pub task_id: TaskId,
+    /// Its pod IP.
+    pub ip: Ipv4Addr,
+}
+
+/// `GET /v1/services` row: a service name and its current endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceInfo {
+    /// Service name, from the task's `[service] name`.
+    pub name: String,
+    /// Endpoints, sorted by task id. Only `Running` tasks with a pod IP.
+    pub endpoints: Vec<ServiceEndpoint>,
 }

@@ -12,6 +12,10 @@ pub enum Error {
     /// A state transition or mutation is not allowed.
     #[error("conflict: {0}")]
     Conflict(String),
+    /// Durable storage failed: the mutation was applied in memory but is
+    /// not guaranteed to survive a crash.
+    #[error("persistence failure: {0}")]
+    Persistence(String),
     /// `JSON` (de)serialization failed.
     #[error(transparent)]
     Serde(#[from] serde_json::Error),

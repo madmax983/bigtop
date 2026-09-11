@@ -5,7 +5,7 @@
 //! so agent restarts and task retries always get the same MAC and tap name
 //! without any coordination.
 
-use crate::ids::TaskId;
+use crate::ids::{NodeId, TaskId};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
@@ -24,6 +24,23 @@ pub struct NetworkSpec {
     /// Guest hostname, e.g. `"web-1"`. Passed to the guest via boot args.
     #[serde(default)]
     pub hostname: Option<String>,
+}
+
+/// Service identity and discovery, from the `[service]` TOML section.
+///
+/// A task that names a service registers its pod IP under that name while
+/// it is `Running`; a task that lists `discover` gets a `BIGTOP_SERVICES`
+/// env var (JSON: service name to sorted IP list) injected at schedule
+/// time. Services need `[network]` enabled: without a pod IP there is
+/// nothing to discover.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ServiceSpec {
+    /// Register this task's pod IP under `name` while it runs.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Service names to discover: each becomes a key in `BIGTOP_SERVICES`.
+    #[serde(default)]
+    pub discover: Vec<String>,
 }
 
 /// The server's IPAM assignment for one task.
@@ -67,10 +84,10 @@ impl fmt::Display for MacAddr {
     }
 }
 
-/// Hash the task id string with the default hasher.
-fn hash_task_id(task_id: &TaskId) -> u64 {
+/// Hash an arbitrary key string with the default hasher.
+fn hash_key(key: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
-    task_id.as_ref().hash(&mut hasher);
+    key.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -81,7 +98,16 @@ fn hash_task_id(task_id: &TaskId) -> u64 {
 /// locally-administered unicast bits: `b[0] = (b[0] & 0xFE) | 0x02`.
 #[must_use]
 pub fn mac_for_task(task_id: &TaskId) -> MacAddr {
-    let digest = hash_task_id(task_id).to_be_bytes();
+    mac_for_str(task_id.as_ref())
+}
+
+/// Deterministic, locally-administered unicast MAC from any key string.
+///
+/// [`mac_for_task`] and [`vtep_mac_for_node`] both build on this so every
+/// networking identifier shares one derivation.
+#[must_use]
+pub fn mac_for_str(key: &str) -> MacAddr {
+    let digest = hash_key(key).to_be_bytes();
     let mut octets = [
         digest[0], digest[1], digest[2], digest[3], digest[4], digest[5],
     ];
@@ -89,11 +115,19 @@ pub fn mac_for_task(task_id: &TaskId) -> MacAddr {
     MacAddr(octets)
 }
 
+/// Deterministic VTEP MAC for a node's VXLAN device, derived from the node
+/// id. Every agent computes the same MAC for a peer, so static FDB entries
+/// need no extra coordination.
+#[must_use]
+pub fn vtep_mac_for_node(node_id: &NodeId) -> MacAddr {
+    mac_for_str(&format!("bigtop-vtep-{node_id}"))
+}
+
 /// Deterministic tap name from the task id: `bt-` + 8 lowercase hex chars
 /// (11 chars total, within the 15-char Linux interface limit).
 #[must_use]
 pub fn tap_name_for(task_id: &TaskId) -> String {
-    let bytes = hash_task_id(task_id).to_le_bytes();
+    let bytes = hash_key(task_id.as_ref()).to_le_bytes();
     let low = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     format!("bt-{low:08x}")
 }
@@ -216,5 +250,65 @@ mod tests {
         assert_ne!(names[0], names[1]);
         assert_ne!(names[1], names[2]);
         assert_ne!(names[0], names[2]);
+    }
+
+    #[test]
+    fn service_spec_parses_from_toml_section() {
+        let toml = r#"
+            name = "web"
+
+            [[task]]
+            name = "web-1"
+            command = "serve"
+
+            [task.service]
+            name = "api"
+            discover = ["db", "cache"]
+        "#;
+        let spec: JobSpec = toml::from_str(toml).expect("parse toml");
+        let svc = &spec.tasks[0].service;
+        assert_eq!(svc.name.as_deref(), Some("api"));
+        assert_eq!(svc.discover, vec!["db".to_string(), "cache".to_string()]);
+    }
+
+    #[test]
+    fn service_spec_defaults_when_section_omitted() {
+        let toml = r#"
+            name = "web"
+
+            [[task]]
+            name = "web-1"
+            command = "serve"
+        "#;
+        let spec: JobSpec = toml::from_str(toml).expect("parse toml");
+        let svc = &spec.tasks[0].service;
+        assert_eq!(svc.name, None);
+        assert_eq!(svc.discover, Vec::<String>::new());
+
+        let defaulted: ServiceSpec = serde_json::from_str("{}").expect("empty object");
+        assert_eq!(defaulted, ServiceSpec::default());
+    }
+
+    #[test]
+    fn mac_for_str_matches_mac_for_task() {
+        let id = task_id(11);
+        assert_eq!(mac_for_str(id.as_ref()), mac_for_task(&id));
+    }
+
+    #[test]
+    fn vtep_mac_is_deterministic_and_locally_administered() {
+        let node = NodeId::from("node-9".to_string());
+        let first = vtep_mac_for_node(&node);
+        let second = vtep_mac_for_node(&node);
+        assert_eq!(first, second);
+        let octets = first.octets();
+        assert_eq!(octets[0] & 0x02, 0x02, "locally-administered bit");
+        assert_eq!(octets[0] & 0x01, 0x00, "unicast bit");
+        // A node's VTEP MAC differs from task MACs and from other nodes'.
+        assert_ne!(
+            first,
+            vtep_mac_for_node(&NodeId::from("node-10".to_string()))
+        );
+        assert_ne!(first, mac_for_task(&task_id(9)));
     }
 }

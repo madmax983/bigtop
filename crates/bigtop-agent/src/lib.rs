@@ -7,6 +7,7 @@
 
 mod firecracker;
 mod jailer;
+mod overlay;
 mod runtime;
 mod snapshot;
 mod tap;
@@ -14,6 +15,10 @@ mod vsock;
 
 pub use firecracker::{FirecrackerConfig, FirecrackerRuntime};
 pub use jailer::{JailerConfig, JailerOptions, JAILED_API_SOCK, JAILED_LOG_PATH};
+pub use overlay::{
+    enslave_to_bridge, fdb_entries_for_peers, vxlan_device_name, FdbEntry, OverlayManager,
+    FDB_RECONCILE_INTERVAL, OVERLAY_BRIDGE, VXLAN_DSTPORT,
+};
 pub use runtime::{ProcessRuntime, RunningTask, Runtime};
 pub use snapshot::{
     resolve_snapshot_paths, snapshot_create_body, snapshot_load_body, SnapshotManager,
@@ -23,13 +28,15 @@ pub use vsock::{LogFrame, LogStream, VsockLogHub, VSOCK_HOST_CID, VSOCK_LOG_PORT
 
 use bigtop_core::{
     api::{
-        PendingSnapshot, PushLogsRequest, RegisterNodeRequest, RegisterNodeResponse,
-        ReportSnapshotResult, RequestSnapshotRequest, RequestSnapshotResponse, SetTaskStateRequest,
+        HeartbeatRequest, OverlayPeer, PendingSnapshot, PushLogsRequest, RegisterNodeRequest,
+        RegisterNodeResponse, ReportSnapshotResult, RequestSnapshotRequest,
+        RequestSnapshotResponse, SetTaskStateRequest,
     },
     NodeId, Resources, SnapshotId, SnapshotPolicy, SnapshotSpec, SnapshotState, Task, TaskId,
     TaskState,
 };
 use std::collections::{HashMap, HashSet};
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,10 +83,17 @@ pub struct AgentConfig {
     pub heartbeat_interval: Duration,
     /// How often to poll for assignments.
     pub poll_interval: Duration,
+    /// Underlay IP of this node, reported to the server for the VXLAN
+    /// overlay (v0.4). `None` opts the node out of the mesh.
+    pub underlay_ip: Option<Ipv4Addr>,
+    /// VXLAN network identifier for the cross-node overlay (v0.4).
+    /// `None` disables the overlay (no host networking changes).
+    pub overlay_vni: Option<u32>,
 }
 
 impl AgentConfig {
     /// Build a config with the v0.1 defaults (2 s heartbeat, 1 s poll).
+    /// The overlay is off until `underlay_ip`/`overlay_vni` are set.
     #[must_use]
     pub const fn new(server_url: String, name: String) -> Self {
         Self {
@@ -87,6 +101,8 @@ impl AgentConfig {
             name,
             heartbeat_interval: Duration::from_secs(2),
             poll_interval: Duration::from_secs(1),
+            underlay_ip: None,
+            overlay_vni: None,
         }
     }
 }
@@ -122,6 +138,10 @@ pub enum AgentError {
     /// Needs `CAP_NET_ADMIN` (or root) and iproute2 on the host.
     #[error("network setup failed: {0}")]
     Network(String),
+    /// The agent's own configuration is inconsistent (e.g. `--vni`
+    /// without `--underlay-ip`).
+    #[error("bad agent configuration: {0}")]
+    Config(String),
 }
 
 /// Snapshot ids this agent already handles: the poll loop skips them so one
@@ -136,12 +156,39 @@ type SnapshotClaims = Arc<std::sync::Mutex<HashSet<SnapshotId>>>;
 /// (see `vsock`); otherwise guests log over the serial console. Snapshot
 /// requests are picked up alongside task assignments.
 ///
+/// When `config.overlay_vni` is set, the agent builds the VXLAN overlay
+/// (device + `bt-br0` bridge) before the loops start and re-reconciles the
+/// static FDB in the background.
+///
 /// # Errors
 ///
-/// Returns [`AgentError`] if registration keeps failing.
+/// Returns [`AgentError`] if registration keeps failing, the overlay
+/// flags are inconsistent, or overlay setup fails.
 pub async fn run_agent(config: AgentConfig, runtime: RuntimeKind) -> Result<(), AgentError> {
     let client = reqwest::Client::new();
     let node_id = register_with_retry(&client, &config).await?;
+    // VXLAN overlay (v0.4): fail fast on inconsistent flags, then build
+    // the device/bridge before any task boots.
+    if let Some(vni) = config.overlay_vni {
+        let Some(underlay_ip) = config.underlay_ip else {
+            return Err(AgentError::Config(
+                "--vni requires --underlay-ip".to_string(),
+            ));
+        };
+        if !matches!(runtime, RuntimeKind::Firecracker(_)) {
+            return Err(AgentError::Config(
+                "--vni requires the firecracker runtime".to_string(),
+            ));
+        }
+        let manager = OverlayManager::new(vni, underlay_ip, node_id.clone());
+        manager.setup().await?;
+        spawn_fdb_reconcile(
+            client.clone(),
+            config.server_url.clone(),
+            node_id.clone(),
+            manager,
+        );
+    }
     // Snapshot ids this agent already handles (dispatched from the poll
     // loop or created by an OnSuccess watcher): the poll loop skips them
     // so one request is never snapshotted twice.
@@ -203,6 +250,7 @@ async fn register(client: &reqwest::Client, config: &AgentConfig) -> Result<Node
         name: config.name.clone(),
         addr: local_label(),
         total: node_resources(),
+        underlay_ip: config.underlay_ip,
     };
     let url = format!("{}/v1/nodes/register", config.server_url);
     let response = post_json(client, &url, &request).await?;
@@ -210,13 +258,54 @@ async fn register(client: &reqwest::Client, config: &AgentConfig) -> Result<Node
     Ok(body.id)
 }
 
-/// Heartbeat until the process dies.
+/// Background loop: fetch the server's overlay peer list and reconcile
+/// the static FDB entries on this node's VXLAN device.
+fn spawn_fdb_reconcile(
+    client: reqwest::Client,
+    server_url: String,
+    node_id: NodeId,
+    mut manager: OverlayManager,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(FDB_RECONCILE_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let url = format!("{server_url}/v1/agents/overlay-peers?node_id={node_id}");
+            match client.get(&url).send().await {
+                Ok(response) => {
+                    let response = match response.error_for_status() {
+                        Ok(response) => response,
+                        Err(err) => {
+                            eprintln!("bigtop agent: overlay-peers rejected: {err}");
+                            continue;
+                        }
+                    };
+                    match response.json::<Vec<OverlayPeer>>().await {
+                        Ok(peers) => {
+                            if let Err(e) = manager.reconcile(&peers).await {
+                                eprintln!("bigtop agent: fdb reconcile failed: {e}");
+                            }
+                        }
+                        Err(e) => eprintln!("bigtop agent: bad overlay-peers body: {e}"),
+                    }
+                }
+                Err(e) => eprintln!("bigtop agent: overlay-peers fetch failed: {e}"),
+            }
+        }
+    });
+}
+
+/// Heartbeat until the process dies. Carries the node's underlay IP so
+/// the server's overlay peer list stays current (v0.4).
 async fn heartbeat_loop(client: &reqwest::Client, config: &AgentConfig, node_id: &NodeId) {
     let mut ticker = tokio::time::interval(config.heartbeat_interval);
+    let body = HeartbeatRequest {
+        underlay_ip: config.underlay_ip,
+    };
     loop {
         ticker.tick().await;
         let url = format!("{}/v1/nodes/{node_id}/heartbeat", config.server_url);
-        match client.post(&url).send().await {
+        match client.post(&url).json(&body).send().await {
             Ok(response) => {
                 if let Err(e) = check_ok(response).await {
                     eprintln!("bigtop agent: heartbeat rejected: {e}");

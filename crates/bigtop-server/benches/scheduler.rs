@@ -2,8 +2,8 @@
 //! see `profiling/profile-scheduler.sh`.
 
 use bigtop_core::{
-    JobId, NetworkSpec, NodeId, NodeInfo, Resources, SnapshotPolicy, Task, TaskId, TaskSpec,
-    TaskState, VmSpec,
+    JobId, NetworkSpec, NodeId, NodeInfo, Resources, ServiceSpec, SnapshotPolicy, Task, TaskId,
+    TaskSpec, TaskState, VmSpec,
 };
 use bigtop_server::{tick, StateInner};
 use chrono::Utc;
@@ -30,6 +30,7 @@ fn synthetic_cluster(node_count: usize, task_count: usize) -> StateInner {
                 },
                 used: Resources::default(),
                 last_heartbeat: now,
+                underlay_ip: None,
             },
         );
     }
@@ -62,6 +63,7 @@ fn synthetic_cluster(node_count: usize, task_count: usize) -> StateInner {
                     node_affinity: None,
                     snapshot_policy: SnapshotPolicy::None,
                     network: NetworkSpec::default(),
+                    service: ServiceSpec::default(),
                 },
                 state: TaskState::Pending,
                 assigned_node: None,
@@ -78,7 +80,7 @@ fn bench_schedule(criterion: &mut Criterion) {
         criterion.bench_function(&format!("schedule/{nodes}_nodes/{tasks}_tasks"), |b| {
             b.iter_batched(
                 || synthetic_cluster(nodes, tasks),
-                |mut state| tick(black_box(&mut state), black_box(Utc::now())),
+                |mut state| tick(black_box(&mut state), black_box(Utc::now())).expect("tick"),
                 BatchSize::SmallInput,
             );
         });

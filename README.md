@@ -91,6 +91,43 @@ runtime — same scheduling, same logs, no virtualization.
   in-memory), and no cross-node pod routing (v0.3 pod IPs are node-local;
   see SPEC.md "Networking (v0.3)" limits).
 
+## The v0.4 deal (honest)
+
+**One big network, and it remembers.**
+
+- ✅ VXLAN cross-node overlay: `bigtop agent --vni 42 --underlay-ip
+  10.0.0.5` builds a `vxlan42` device + `bt-br0` bridge, enslaves every
+  task tap, and maintains static FDB entries for every other alive
+  overlay node (VTEP MACs are deterministic per node id, no extra
+  coordination; reconciled every 10 s). Opt-in — without the flags the
+  agent touches no host networking.
+- ✅ Service discovery: `[task.service] name = "api"` registers the
+  task's pod IP while it runs; `discover = ["db"]` injects
+  `BIGTOP_SERVICES` (`{"db":["172.28.0.2"],"cache":[]}`) at schedule
+  time. `bigtop services` / `GET /v1/services` show the live registry,
+  derived from task state — nothing to drift.
+- ✅ Prometheus metrics at `GET /metrics`: task counts by state,
+  `bigtop_nodes_up`, `bigtop_scheduler_tick_ms`, IPAM usage, and
+  `bigtop_snapshots_done`. Agent-side metrics are deferred.
+- ✅ Server persistence: `bigtop server --data-dir ./data` journals
+  every mutation to `journal.jsonl` (fsync per op, before the mutation
+  is acknowledged), replays on startup, and compacts to
+  `snapshot.json` on clean shutdown (Ctrl-C/SIGTERM). A second server
+  on the same directory is refused by the lock file.
+- ✅ Status page: `GET /` serves static, server-rendered HTML — nodes,
+  services, tasks, IPAM, link to `/metrics`. No JS.
+- ⚠️ The overlay, FDB reconciliation, and tap bridging are implemented
+  against real iproute2 semantics and unit-tested (exact argv, FDB
+  diffing), but **unverified on real hardware**: no `CAP_NET_ADMIN` or
+  second host here, so no VXLAN device has ever been created by this
+  code and no encapsulated packet has ever flown. With
+  `--jailer --netns` the tap lives in the jail's netns and bridging it
+  there is the operator's job (the agent says so in the docs, and does
+  not attempt it).
+- ⚠️ Virtual IPs / load balancers are an explicit non-goal: discovery
+  hands out raw pod IPs and the client picks. That's the v0.5
+  conversation.
+
 ## Jailer host setup
 
 `bigtop agent --jailer` needs a cooperating host. The jailer creates
@@ -163,6 +200,53 @@ contract, including a minimal init snippet, is in SPEC.md
 "Networking (v0.3)". DHCP is a deliberate non-goal: static assignment
 keeps the server's IPAM the single source of truth.
 
+## Overlay host setup (v0.4)
+
+Opt-in per agent. Without `--vni` the agent creates no VXLAN device, no
+bridge, and no FDB entries — v0.3 behavior is unchanged.
+
+```bash
+# Needs CAP_NET_ADMIN (or root) + iproute2, same as v0.3 tap provisioning:
+sudo setcap cap_net_admin+ep $(which bigtop)   # or run the agent as root
+
+# Join the mesh (VNI 42 is the convention; any u32 works):
+bigtop agent --server http://10.0.0.1:4667 --name node-2 \
+  --vni 42 --underlay-ip 10.0.0.5
+```
+
+`--vni` requires `--underlay-ip` (the address other nodes' encapsulated
+packets arrive at — it must be reachable from every peer) and the
+firecracker runtime (the process runtime never touches host
+networking). At startup the agent creates `vxlan<vni>` (destination
+port 4789) with a deterministic VTEP MAC, creates `bt-br0`, brings both
+up, and enslaves the VXLAN device to the bridge; task taps join
+`bt-br0` as they are created. Setup is idempotent across agent
+restarts. Each agent polls `GET /v1/agents/overlay-peers` and keeps one
+static FDB entry per peer — broadcast/unknown-unicast is flooded, so no
+multicast underlay is needed.
+
+Jailer + netns: the tap is moved into the jail's netns and **not**
+bridged there — wire it into the overlay inside the jail yourself (the
+agent logs what it skipped).
+
+## Persistence (v0.4)
+
+```bash
+bigtop server --port 4667 --data-dir ./bigtop-data
+```
+
+Every mutation is appended to `journal.jsonl` and fsynced before it is
+acknowledged — expect a small latency cost per mutation in exchange for
+crash safety (the journal stores whole records, not deltas, so it also
+grows: watch disk on write-heavy clusters). On startup the server loads
+`snapshot.json` if present, then replays the journal; a torn final line
+is truncated with a warning, any other corruption aborts startup
+loudly. On clean shutdown the server writes a fresh `snapshot.json`
+(temp file + rename) and truncates the journal. `bigtop.lock` in the
+directory refuses a second server — a `kill -9` leaves the stale lock
+behind on purpose (fail closed); remove it only after confirming no
+server is running.
+
 ## Roadmap
 
 - **v0.2** — ✅ Done: snapshot/restore, vsock log streaming, jailer
@@ -172,10 +256,14 @@ keeps the server's IPAM the single source of truth.
   one static IP per task), kernel-cmdline guest contract, `setup-nat.sh`
   host plumbing. (Deferred: reference guest init, server persistence,
   cross-node pod routing.)
-- **v0.4** — Cross-node overlay (VXLAN mesh so pod IPs are routable
-  cluster-wide — the natural sequel to v0.3's node-local `/24`s),
-  service discovery + virtual IPs, per-task network counters/metrics
-  endpoint, web dashboard, server persistence.
+- **v0.4** — ✅ Done: one big network, and it remembers — VXLAN
+  cross-node overlay (opt-in, VNI 42), service discovery over pod IPs
+  (`BIGTOP_SERVICES`, `bigtop services`), Prometheus metrics, durable
+  server persistence (JSONL journal + fsync + snapshots), and a tiny
+  server-rendered status page. (Deferred: virtual IPs / load balancers.)
+- **v0.5** — Dial by name: service virtual IPs with load-balanced
+  endpoints and cluster DNS, finishing the service-networking story
+  v0.4 started.
 
 ## Profiling
 

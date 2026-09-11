@@ -54,6 +54,11 @@ pub struct FirecrackerConfig {
     /// Sandbox every microVM in `firecracker-jailer`. `None` spawns
     /// firecracker directly.
     pub jailer: Option<JailerOptions>,
+    /// VXLAN network identifier for the cross-node overlay (v0.4). When
+    /// set, each task tap is enslaved to the `bt-br0` bridge the agent's
+    /// [`OverlayManager`](crate::OverlayManager) built at startup.
+    /// `None` keeps the v0.3 behavior (standalone taps).
+    pub overlay_vni: Option<u32>,
 }
 
 impl Default for FirecrackerConfig {
@@ -63,6 +68,7 @@ impl Default for FirecrackerConfig {
             vm_dir: PathBuf::from("/tmp/bigtop-vms"),
             boot_timeout: Duration::from_secs(10),
             jailer: None,
+            overlay_vni: None,
         }
     }
 }
@@ -191,14 +197,39 @@ impl FirecrackerRuntime {
             ));
         }
         let tap = TapDevice::create(&tap_name_for(&task.id)).await?;
-        tap.set_up().await?;
-        if let Some(netns) = self
-            .config
-            .jailer
-            .as_ref()
-            .and_then(|opts| opts.netns.as_ref())
-        {
-            tap.move_to_netns(netns).await?;
+        // Every step after creation can fail; destroy the tap on any of
+        // them so no failure path leaks a device.
+        let configured = async {
+            tap.set_up().await?;
+            // VXLAN overlay (v0.4): hang the tap off bt-br0 so the guest joins
+            // the cross-node mesh. With a jailer netns the tap lives in the
+            // jail's namespace instead: bridging it there is the operator's
+            // job (documented in the README), so we skip it here.
+            let in_netns = self
+                .config
+                .jailer
+                .as_ref()
+                .and_then(|opts| opts.netns.as_ref())
+                .is_some();
+            if self.config.overlay_vni.is_some() && !in_netns {
+                crate::overlay::enslave_to_bridge(tap.name()).await?;
+            }
+            if let Some(netns) = self
+                .config
+                .jailer
+                .as_ref()
+                .and_then(|opts| opts.netns.as_ref())
+            {
+                tap.move_to_netns(netns).await?;
+            }
+            Ok::<_, AgentError>(())
+        }
+        .await;
+        if let Err(err) = configured {
+            if let Err(te) = tap.destroy().await {
+                eprintln!("bigtop agent: tap destroy failed: {te}");
+            }
+            return Err(err);
         }
         Ok(Some(tap))
     }
@@ -781,8 +812,8 @@ fn parse_status(response: &[u8]) -> (u16, String) {
 mod tests {
     use super::*;
     use bigtop_core::{
-        JobId, NetworkAssignment, NetworkSpec, Resources, SnapshotLoadSpec, SnapshotPolicy,
-        TaskSpec, TaskState, VmSpec,
+        JobId, NetworkAssignment, NetworkSpec, Resources, ServiceSpec, SnapshotLoadSpec,
+        SnapshotPolicy, TaskSpec, TaskState, VmSpec,
     };
     use std::collections::HashMap;
     use std::net::Ipv4Addr;
@@ -816,6 +847,7 @@ mod tests {
                     enabled: false,
                     hostname: None,
                 },
+                service: ServiceSpec::default(),
             },
             state: TaskState::Pending,
             assigned_node: None,

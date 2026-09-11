@@ -1,12 +1,13 @@
 //! Domain types: resources, VM specs, task specs, tasks, and nodes.
 
 use crate::ids::{JobId, NodeId, TaskId};
-use crate::network::{NetworkAssignment, NetworkSpec};
+use crate::network::{NetworkAssignment, NetworkSpec, ServiceSpec};
 use crate::snapshots::{SnapshotLoadSpec, SnapshotPolicy};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::net::Ipv4Addr;
 
 /// A node is dead when its heartbeat is older than this many seconds.
 pub const HEARTBEAT_TIMEOUT_SECS: i64 = 10;
@@ -128,6 +129,10 @@ pub struct TaskSpec {
     /// Disabled by default.
     #[serde(default)]
     pub network: NetworkSpec,
+    /// Service identity and discovery, from the `[service]` TOML section.
+    /// Empty by default: the task registers no service and discovers none.
+    #[serde(default)]
+    pub service: ServiceSpec,
 }
 
 const fn default_count() -> u32 {
@@ -214,6 +219,11 @@ pub struct NodeInfo {
     pub name: String,
     /// Informational address label (v0.1; used by service discovery in v0.3).
     pub addr: String,
+    /// Underlay IP of this node, for the VXLAN overlay (v0.4). `None`
+    /// when the agent did not report one (e.g. `--underlay-ip` omitted);
+    /// such nodes are skipped when building the VTEP mesh.
+    #[serde(default)]
+    pub underlay_ip: Option<Ipv4Addr>,
     /// Total resources the node offers.
     pub total: Resources,
     /// Resources currently committed to non-terminal tasks.
@@ -393,6 +403,7 @@ mod tests {
                 node_affinity: None,
                 snapshot_policy: SnapshotPolicy::None,
                 network: NetworkSpec::default(),
+                service: ServiceSpec::default(),
             },
             state: TaskState::Pending,
             assigned_node: None,
@@ -407,6 +418,7 @@ mod tests {
             id: NodeId::from("node-1".to_string()),
             name: "n".to_string(),
             addr: "127.0.0.1".to_string(),
+            underlay_ip: None,
             total: Resources {
                 cpu_millis: 4000,
                 mem_mb: 8192,
@@ -426,6 +438,7 @@ mod tests {
             id: NodeId::generate(),
             name: "n".to_string(),
             addr: String::new(),
+            underlay_ip: None,
             total: Resources::default(),
             used: Resources::default(),
             last_heartbeat: now,

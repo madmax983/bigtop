@@ -2,7 +2,9 @@
 //! run a 2-task job all the way to `Succeeded`, with logs.
 
 use bigtop_agent::{run_agent, AgentConfig, ProcessRuntime, RuntimeKind};
-use bigtop_core::{JobSpec, NetworkSpec, Resources, SnapshotPolicy, TaskSpec, TaskState, VmSpec};
+use bigtop_core::{
+    JobSpec, NetworkSpec, Resources, ServiceSpec, SnapshotPolicy, TaskSpec, TaskState, VmSpec,
+};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -28,6 +30,7 @@ fn echo_spec() -> TaskSpec {
         node_affinity: None,
         snapshot_policy: SnapshotPolicy::None,
         network: NetworkSpec::default(),
+        service: ServiceSpec::default(),
     }
 }
 

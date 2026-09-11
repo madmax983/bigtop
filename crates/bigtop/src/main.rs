@@ -1,6 +1,6 @@
 //! `bigtop`: one binary. Server, agent, and CLI for the microVM orchestrator.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use bigtop_agent::{
     auto_runtime, run_agent, AgentConfig, FirecrackerConfig, FirecrackerRuntime, JailerOptions,
     ProcessRuntime, RuntimeKind,
@@ -10,6 +10,7 @@ use bigtop_server::{serve_config, ServerConfig};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 /// Default server URL for CLI commands.
@@ -61,6 +62,10 @@ enum Commands {
         /// Pod network CIDR for per-task IPs (a /16, carved into /24s per node).
         #[arg(long, default_value = "172.28.0.0/16")]
         network_cidr: String,
+        /// Data directory for the journal and snapshots (enables
+        /// crash-safe persistence; in-memory when omitted).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
     /// Run the `BigTop` agent.
     Agent {
@@ -97,6 +102,15 @@ enum Commands {
         /// Network namespace path the jail joins (optional).
         #[arg(long)]
         netns: Option<PathBuf>,
+        /// VXLAN network identifier for the cross-node overlay (enables it).
+        /// Task taps join `bt-br0` and the agent meshes VTEPs with peers.
+        /// Needs `CAP_NET_ADMIN`; requires the firecracker runtime.
+        #[arg(long)]
+        vni: Option<u32>,
+        /// This node's underlay IP for the VXLAN overlay (required with
+        /// `--vni`); reported to the server so peers can reach this VTEP.
+        #[arg(long)]
+        underlay_ip: Option<Ipv4Addr>,
     },
     /// Submit a job from a TOML file.
     Run {
@@ -122,6 +136,12 @@ enum Commands {
     Logs {
         /// Task id.
         task_id: String,
+        /// Server base URL.
+        #[arg(long, default_value = DEFAULT_SERVER)]
+        server: String,
+    },
+    /// List services and their running endpoints.
+    Services {
         /// Server base URL.
         #[arg(long, default_value = DEFAULT_SERVER)]
         server: String,
@@ -198,7 +218,8 @@ async fn main() -> Result<()> {
             port,
             bind,
             network_cidr,
-        } => cmd_server(&bind, port, &network_cidr).await,
+            data_dir,
+        } => cmd_server(&bind, port, &network_cidr, data_dir).await,
         Commands::Agent {
             server,
             name,
@@ -211,6 +232,8 @@ async fn main() -> Result<()> {
             jailer_gid,
             chroot_base_dir,
             netns,
+            vni,
+            underlay_ip,
         } => {
             cmd_agent(AgentOptions {
                 server: &server,
@@ -224,6 +247,8 @@ async fn main() -> Result<()> {
                 jailer_gid,
                 chroot_base_dir: &chroot_base_dir,
                 netns,
+                vni,
+                underlay_ip,
             })
             .await
         }
@@ -231,6 +256,7 @@ async fn main() -> Result<()> {
         Commands::Ps { server } => cmd_ps(&server).await,
         Commands::Nodes { server } => cmd_nodes(&server).await,
         Commands::Logs { task_id, server } => cmd_logs(&task_id, &server).await,
+        Commands::Services { server } => cmd_services(&server).await,
         Commands::Snapshot { action } => match action {
             SnapshotCommands::Create {
                 task_id,
@@ -260,7 +286,12 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn cmd_server(bind: &str, port: u16, network_cidr: &str) -> Result<()> {
+async fn cmd_server(
+    bind: &str,
+    port: u16,
+    network_cidr: &str,
+    data_dir: Option<PathBuf>,
+) -> Result<()> {
     let addr: std::net::SocketAddr = format!("{bind}:{port}")
         .parse()
         .context("invalid bind address")?;
@@ -268,9 +299,13 @@ async fn cmd_server(bind: &str, port: u16, network_cidr: &str) -> Result<()> {
         .await
         .context("binding server socket")?;
     println!("bigtop server: listening on {addr} (loud and proud)");
+    if let Some(dir) = &data_dir {
+        println!("bigtop server: persisting to {}", dir.display());
+    }
     let config = ServerConfig {
         tick_interval: std::time::Duration::from_millis(500),
         network_cidr: network_cidr.to_string(),
+        data_dir,
     };
     serve_config(listener, config).await?;
     Ok(())
@@ -289,9 +324,17 @@ struct AgentOptions<'a> {
     jailer_gid: u32,
     chroot_base_dir: &'a Path,
     netns: Option<PathBuf>,
+    vni: Option<u32>,
+    underlay_ip: Option<Ipv4Addr>,
 }
 
 async fn cmd_agent(opts: AgentOptions<'_>) -> Result<()> {
+    if opts.vni.is_some() && opts.underlay_ip.is_none() {
+        bail!("--vni requires --underlay-ip");
+    }
+    if opts.vni.is_some() && opts.runtime == RuntimeChoice::Process {
+        bail!("--vni requires the firecracker runtime (not --runtime process)");
+    }
     let name = opts
         .name
         .unwrap_or_else(|| std::env::var("HOSTNAME").unwrap_or_else(|_| "agent".to_string()));
@@ -307,6 +350,7 @@ async fn cmd_agent(opts: AgentOptions<'_>) -> Result<()> {
         bin: PathBuf::from(opts.firecracker_bin),
         vm_dir: opts.vm_dir.to_path_buf(),
         jailer: jailer_opts,
+        overlay_vni: opts.vni,
         ..FirecrackerConfig::default()
     };
     let kind = match opts.runtime {
@@ -326,7 +370,13 @@ async fn cmd_agent(opts: AgentOptions<'_>) -> Result<()> {
         println!("bigtop agent '{name}': jailer sandboxing enabled");
     }
     println!("bigtop agent '{name}': registering with {}", opts.server);
-    run_agent(AgentConfig::new(opts.server.to_string(), name), kind).await?;
+    if let (Some(vni), Some(ip)) = (opts.vni, opts.underlay_ip) {
+        println!("bigtop agent '{name}': VXLAN overlay on (vni {vni}, underlay {ip})");
+    }
+    let mut agent_config = AgentConfig::new(opts.server.to_string(), name);
+    agent_config.underlay_ip = opts.underlay_ip;
+    agent_config.overlay_vni = opts.vni;
+    run_agent(agent_config, kind).await?;
     Ok(())
 }
 
@@ -405,6 +455,20 @@ async fn cmd_nodes(server: &str) -> Result<()> {
             cpu,
             mem,
         );
+    }
+    Ok(())
+}
+
+async fn cmd_services(server: &str) -> Result<()> {
+    let services: Vec<bigtop_core::ServiceInfo> = get_json(server, "/v1/services").await?;
+    println!("{:<24} ENDPOINTS", "SERVICE");
+    for service in services {
+        let endpoints: Vec<String> = service
+            .endpoints
+            .iter()
+            .map(|e| format!("{} ({})", truncate(e.task_id.as_ref(), 20), e.ip))
+            .collect();
+        println!("{:<24} {}", service.name, endpoints.join(", "));
     }
     Ok(())
 }

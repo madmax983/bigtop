@@ -1,10 +1,15 @@
-# BigTop v0.2 — Spec
+# BigTop v0.4 — Spec
 
 BigTop is a Firecracker-first orchestrator. Every workload is a microVM:
 the security of VMs with the speed of containers. One binary, opinionated,
 loud. v0.1 "spark" shipped job submission, scheduling, and agents that boot
-microVMs. v0.2 hardens the Firecracker path: snapshot/restore, vsock log
-streaming, and `firecracker-jailer` sandboxing.
+microVMs. v0.2 hardened the Firecracker path: snapshot/restore, vsock log
+streaming, and `firecracker-jailer` sandboxing. v0.3 gave every task an
+identity on the wire: per-task taps, server IPAM, and a static guest
+network contract. v0.4 is **one big network, and it remembers**: a VXLAN
+cross-node overlay mesh, service discovery over the overlay, Prometheus
+metrics, and crash-safe server persistence — plus a tiny status page on
+top.
 
 ## Terms
 
@@ -33,6 +38,15 @@ streaming, and `firecracker-jailer` sandboxing.
 | `GET` | `/v1/tasks/{id}/snapshots` | — | `[SnapshotRecord]` oldest first |
 | `GET` | `/v1/agents/snapshot-requests?node_id=` | — | `[PendingSnapshot]` for that node, oldest first |
 | `POST` | `/v1/tasks/{id}/snapshots/{snapshot_id}/result` | `{state, node_id, mem_file_path?, snapshot_path?, error?}` | `200`; `404`; `409` illegal transition |
+| `GET` | `/v1/services` | — | `[{name, endpoints: [{task_id, ip}]}]` sorted by name |
+| `GET` | `/v1/agents/overlay-peers?node_id=` | — | `[{node_id, underlay_ip}]` for other alive overlay nodes |
+| `GET` | `/metrics` | — | Prometheus text format (see "Metrics (v0.4)") |
+| `GET` | `/` | — | static HTML status page (see "Status page (v0.4)") |
+
+Node registration (`POST /v1/nodes/register`) takes
+`{name, addr, total, underlay_ip?}`: `underlay_ip` is the node's address
+on the underlay network, used as its VXLAN VTEP address. Nodes that omit
+it do not join the overlay mesh.
 
 Job spec validation (`400 invalid job spec`): non-empty name, at least one
 task spec, non-empty command per spec, `count >= 1`.
@@ -84,6 +98,12 @@ mem_mb = 128
 # [task.network]
 # enabled = true
 # hostname = "web-1"   # optional; passed to the guest as bigtop.hostname
+
+# Service identity and discovery (v0.4). Optional. Needs [task.network]
+# enabled: without a pod IP there is nothing to discover.
+# [task.service]
+# name = "api"            # register this task's pod IP under "api"
+# discover = ["db"]       # inject BIGTOP_SERVICES with db's current IPs
 ```
 
 `[[task]]` also deserializes from JSON as `"tasks": [...]`.
@@ -345,6 +365,111 @@ Same lifecycle, but `tokio::process::Command` directly. Injects
 `BIGTOP_TASK` and `BIGTOP_JOB` env vars. Used by the integration test and
 the local demo.
 
+### VXLAN overlay (v0.4)
+
+One big network: every node's pod subnets stitched into a single L2
+overlay with VXLAN.
+
+**Agent flags.** `bigtop agent --vni 42 --underlay-ip 10.0.0.5` opts the
+node into the mesh (both required together; `--vni` also requires the
+firecracker runtime — the process runtime never touches host networking).
+`--vni` defaults to nothing (overlay off); the conventional default when
+enabling is VNI 42. The underlay IP is the address other nodes'
+encapsulated packets arrive at: it must be reachable from every peer.
+
+**Device model.** At startup the agent creates `vxlan<vni>` (`ip link add
+<dev> type vxlan id <vni> dstport 4789`, ungrouped/unicast mode) with a
+deterministic VTEP MAC derived from the node id
+(`vtep_mac_for_node`: `02:xx:…` locally-administered unicast, the same
+derivation as task MACs), creates the `bt-br0` bridge, brings both up,
+and enslaves the VXLAN device to the bridge. Every task tap is then
+enslaved to `bt-br0` as it is created (after `up`, before any jailer
+netns move). Re-running setup is idempotent: already-existing devices
+are left in place.
+
+**Mesh.** Each agent polls
+`GET /v1/agents/overlay-peers?node_id=<self>` and maintains one static
+FDB entry per peer:
+`bridge fdb append <peer-vtep-mac> dev vxlan<vni> dst <peer-underlay-ip>`.
+VTEP MACs are pure functions of node ids, so no extra coordination is
+needed. Reconciliation runs every 10 s, add-before-delete; a failed
+delete is logged and retried next round. Broadcast/unknown-unicast
+frames are flooded to every VTEP — no multicast underlay required.
+
+**Limits (honest):** implemented against real iproute2 semantics and
+unit-tested (exact argv, FDB diffing, VTEP MAC derivation), but
+**unverified on real hardware** — this environment has no `CAP_NET_ADMIN`
+or second host, so no VXLAN device, bridge, or FDB entry has ever been
+created by this code, and no encapsulated packet has ever flown. With
+`--jailer --netns`, the tap lives in the jail's netns and the operator
+must bridge it there; the agent documents this and does not attempt it.
+
+### Service discovery (v0.4)
+
+Tasks opt in with `[task.service]`: `name` registers the task's pod IP
+under a service name while the task is `Running`; `discover` lists the
+service names the task wants to find.
+
+The server derives the registry from task state — no separate store to
+drift. `GET /v1/services` returns every service with its current
+endpoints (`[{task_id, ip}]`, sorted), and `bigtop services` prints the
+same table. A task contributes an endpoint only while `Running` with a
+network assignment; terminal transitions and dead-node requeues remove
+it.
+
+At schedule time, the scheduler injects `BIGTOP_SERVICES` into the
+task's environment: JSON mapping each discovered name to its current
+sorted IP list, e.g. `{"api":["172.28.0.2"],"db":[]}`. Names with no
+running endpoints map to `[]` — the task decides how to handle an empty
+discovery result.
+
+**Non-goal:** virtual IPs / load balancers. There is no VIP, no
+kube-proxy-style DNAT, no health-checked endpoint selection — discovery
+hands out the raw pod IPs and the client picks. That is the v0.5+
+conversation, not this one.
+
+### Metrics (v0.4)
+
+`GET /metrics` renders Prometheus text format, only values the server
+actually maintains:
+
+- `bigtop_tasks{state="pending|assigned|running|succeeded|failed"}`
+- `bigtop_nodes_up` — nodes with a recent heartbeat
+- `bigtop_scheduler_tick_ms` — wall-clock duration of the last tick
+- `bigtop_ipam_allocated` / `bigtop_ipam_total` — pod IP usage vs capacity
+- `bigtop_snapshots_done` — snapshots that reached `Done`
+
+Agent-side metrics are deferred.
+
+### Persistence (v0.4)
+
+The server remembers: `bigtop server --data-dir ./bigtop-data` journals
+every state mutation to `<dir>/journal.jsonl` — one JSON object per
+line, `fsync`ed before the mutation is acknowledged. On startup the
+server replays the journal in order and resumes exactly where it left
+off (tasks, nodes, IPAM, snapshots, and the derived service registry;
+log tails are rebuilt empty — logs are not persisted).
+
+The journal stores whole post-state records per mutation, not deltas.
+A corrupt final line is treated as a torn write from a crash and
+truncated with a warning; any other corrupt line aborts startup loudly.
+
+On clean shutdown (Ctrl-C/SIGTERM) the server compacts: it writes
+`<dir>/snapshot.json` (the full durable state, via temp-file + rename)
+and truncates the journal, so the next boot replays at most the ops
+since the last clean stop.
+
+The data directory is protected by an exclusive lock
+(`<dir>/bigtop.lock`, created with `create_new` and removed on drop):
+a second server on the same directory is refused at startup.
+
+### Status page (v0.4)
+
+`GET /` serves a static, server-rendered HTML page — no JavaScript, no
+framework: tables of nodes (liveness, underlay, resource use), services
+with endpoints, tasks (state, node, pod IP, service), and IPAM usage,
+plus a link to `/metrics`.
+
 ## Failure semantics
 
 - Terminal states are final: `409 conflict` on any transition out of
@@ -352,9 +477,15 @@ the local demo.
 - Dead node → its tasks requeue (see scheduler). No checkpointing in v0.1:
   a requeued task restarts from scratch.
 - Agent crash: heartbeats stop → node dies after 10 s → tasks requeue.
-- Server crash: all state is in memory; everything is lost (persistence is
-  v0.2+). Agents keep heartbeating and re-register as a new node id.
-- Logs: last 200 lines per task, in memory.
+- Server crash: with `--data-dir`, the journal replays on restart and
+  the cluster resumes (in-flight tasks return to `Pending` via the
+  dead-node path once their agents re-register — agents re-register as
+  *new* node ids, so pre-crash placements are not trusted). Without
+  `--data-dir`, all state is in memory and a crash loses everything
+  (the v0.3 behavior).
+- Double-start on one data directory: the second server is refused by
+  the lock file.
+- Logs: last 200 lines per task, in memory, not persisted.
 
 ## IDs
 
@@ -364,11 +495,12 @@ Unique per process; sortable; safe in env vars and shell.
 ## CLI
 
 ```
-bigtop server [--port 4667] [--bind 127.0.0.1] [--network-cidr 172.28.0.0/16]
-bigtop agent --server http://127.0.0.1:4667 [--name NAME] [--runtime auto] [--vm-dir DIR] [--firecracker-bin BIN] [--jailer] [--jailer-bin BIN] [--jailer-uid UID] [--jailer-gid GID] [--chroot-base-dir DIR] [--netns PATH]
+bigtop server [--port 4667] [--bind 127.0.0.1] [--network-cidr 172.28.0.0/16] [--data-dir DIR]
+bigtop agent --server http://127.0.0.1:4667 [--name NAME] [--runtime auto] [--vm-dir DIR] [--firecracker-bin BIN] [--jailer] [--jailer-bin BIN] [--jailer-uid UID] [--jailer-gid GID] [--chroot-base-dir DIR] [--netns PATH] [--vni VNI] [--underlay-ip IP]
 bigtop run <job.toml> [--server URL]
 bigtop ps [--server URL]
 bigtop nodes [--server URL]
+bigtop services [--server URL]
 bigtop logs <task-id> [--server URL]
 bigtop snapshot create <task-id> [--kind full|diff] [--mem-path PATH] [--snap-path PATH] [--server URL]
 bigtop snapshot list <task-id> [--server URL]

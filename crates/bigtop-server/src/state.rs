@@ -1,13 +1,17 @@
 //! In-memory store and the mutations the API performs on it.
 
 use crate::ipam::Ipam;
+use crate::journal::{JournalOp, JournalWriter};
 use bigtop_core::{
     Error, JobId, JobSpec, NodeId, NodeInfo, PendingSnapshot, ReportSnapshotResult,
-    RequestSnapshotRequest, Resources, SnapshotId, SnapshotRecord, SnapshotSpec, SnapshotState,
-    Task, TaskId, TaskState,
+    RequestSnapshotRequest, Resources, ServiceEndpoint, ServiceInfo, SnapshotId, SnapshotRecord,
+    SnapshotSpec, SnapshotState, Task, TaskId, TaskState,
 };
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::io;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -15,7 +19,7 @@ use tokio::sync::RwLock;
 const MAX_LOG_LINES: usize = 200;
 
 /// Metadata kept per submitted job.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRecord {
     /// Job name.
     pub name: String,
@@ -41,6 +45,12 @@ pub struct StateInner {
     pub snapshots: HashMap<SnapshotId, SnapshotRecord>,
     /// IP address management for the task network.
     pub ipam: Ipam,
+    /// Journal for durable mutations (v0.4). `None` when the server runs
+    /// without a data directory: state is purely in-memory.
+    pub(crate) journal: Option<JournalWriter>,
+    /// Wall-clock duration of the last scheduler tick, in milliseconds
+    /// (v0.4; exposed on `/metrics`).
+    pub(crate) last_tick_ms: Option<u64>,
 }
 
 /// Shared handle to the server state.
@@ -64,6 +74,15 @@ impl AppState {
                 ipam,
                 ..StateInner::default()
             })),
+        }
+    }
+
+    /// Create shared state from a fully-built [`StateInner`] (used when
+    /// replaying the journal on startup).
+    #[must_use]
+    pub fn from_inner(inner: StateInner) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(inner)),
         }
     }
 }
@@ -114,6 +133,7 @@ pub fn create_job(
 ) -> Result<JobId, Error> {
     validate(spec)?;
     let job_id = JobId::generate();
+    let mut tasks = Vec::new();
     for task_spec in &spec.tasks {
         for _ in 0..task_spec.count {
             let mut one = task_spec.clone();
@@ -129,7 +149,8 @@ pub fn create_job(
                 network: None,
             };
             inner.logs.insert(task.id.clone(), VecDeque::new());
-            inner.tasks.insert(task.id.clone(), task);
+            inner.tasks.insert(task.id.clone(), task.clone());
+            tasks.push(task);
         }
     }
     inner.jobs.insert(
@@ -139,44 +160,124 @@ pub fn create_job(
             created_at: now,
         },
     );
+    journal_op(
+        inner,
+        &JournalOp::CreateJob {
+            job_id: job_id.clone(),
+            name: spec.name.clone(),
+            created_at: now,
+            tasks,
+        },
+    )
+    .map_err(|e| journal_err(&e))?;
     Ok(job_id)
 }
 
+/// Append a mutation to the journal, if one is attached.
+///
+/// The append is fsynced before this returns, so a successful return
+/// means the mutation will survive a crash. Callers propagate the error:
+/// a mutation is only acknowledged once it is durable.
+pub fn journal_op(inner: &mut StateInner, op: &JournalOp) -> io::Result<()> {
+    if let Some(journal) = inner.journal.as_mut() {
+        journal.append(op)?;
+    }
+    Ok(())
+}
+
+/// Map a journal I/O failure to the shared error type.
+pub fn journal_err(err: &io::Error) -> Error {
+    Error::Persistence(err.to_string())
+}
+
 /// Register a node. Returns the assigned node id.
+///
+/// The registration is journaled and fsynced before this returns, so a
+/// successful return means the node will survive a crash.
+///
+/// # Errors
+///
+/// Returns [`Error::Persistence`] when the journal append fails.
 pub fn register_node(
     inner: &mut StateInner,
     name: String,
     addr: String,
     total: Resources,
+    underlay_ip: Option<std::net::Ipv4Addr>,
     now: DateTime<Utc>,
-) -> NodeId {
+) -> Result<NodeId, Error> {
     let id = NodeId::generate();
-    inner.nodes.insert(
-        id.clone(),
-        NodeInfo {
-            id: id.clone(),
-            name,
-            addr,
-            total,
-            used: Resources::default(),
-            last_heartbeat: now,
-        },
-    );
-    id
+    let node = NodeInfo {
+        id: id.clone(),
+        name,
+        addr,
+        total,
+        underlay_ip,
+        used: Resources::default(),
+        last_heartbeat: now,
+    };
+    inner.nodes.insert(id.clone(), node.clone());
+    journal_op(inner, &JournalOp::RegisterNode { node }).map_err(|e| journal_err(&e))?;
+    Ok(id)
 }
 
-/// Record a heartbeat.
+/// Record a heartbeat, refreshing the node's underlay address when the
+/// agent reports one (v0.4).
 ///
 /// # Errors
 ///
 /// Returns [`Error::NotFound`] for an unknown node id.
-pub fn heartbeat(inner: &mut StateInner, id: &NodeId, now: DateTime<Utc>) -> Result<(), Error> {
+pub fn heartbeat(
+    inner: &mut StateInner,
+    id: &NodeId,
+    underlay_ip: Option<Ipv4Addr>,
+    now: DateTime<Utc>,
+) -> Result<(), Error> {
     let node = inner
         .nodes
         .get_mut(id)
         .ok_or_else(|| Error::NotFound(format!("node {id}")))?;
     node.last_heartbeat = now;
+    if let Some(ip) = underlay_ip {
+        node.underlay_ip = Some(ip);
+    }
     Ok(())
+}
+
+/// Service discovery view: one entry per service name with the pod IPs of
+/// its currently `Running` tasks (v0.4).
+///
+/// Only tasks that are `Running` **and** hold a network assignment
+/// contribute endpoints. Entries are sorted by service name, endpoints by
+/// task id, so the output is deterministic.
+#[must_use]
+pub fn service_endpoints(inner: &StateInner) -> Vec<ServiceInfo> {
+    let mut by_name: HashMap<String, Vec<ServiceEndpoint>> = HashMap::new();
+    for task in inner.tasks.values() {
+        let (Some(name), Some(network)) = (task.spec.service.name.as_ref(), task.network.as_ref())
+        else {
+            continue;
+        };
+        if task.state != TaskState::Running {
+            continue;
+        }
+        by_name
+            .entry(name.clone())
+            .or_default()
+            .push(ServiceEndpoint {
+                task_id: task.id.clone(),
+                ip: network.ip,
+            });
+    }
+    let mut out: Vec<ServiceInfo> = by_name
+        .into_iter()
+        .map(|(name, mut endpoints)| {
+            endpoints.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+            ServiceInfo { name, endpoints }
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 /// Move a task to a new state.
@@ -210,8 +311,25 @@ pub fn set_task_state(
     }
     if terminal {
         // The task's IP returns to the pool; double-release is safe.
-        let _ = inner.ipam.release(id);
+        if inner.ipam.release(id) {
+            journal_op(
+                inner,
+                &JournalOp::IpamRelease {
+                    task_id: id.clone(),
+                },
+            )
+            .map_err(|e| journal_err(&e))?;
+        }
     }
+    journal_op(
+        inner,
+        &JournalOp::SetTaskState {
+            task_id: id.clone(),
+            state,
+            exit_code,
+        },
+    )
+    .map_err(|e| journal_err(&e))?;
     Ok(())
 }
 
@@ -244,22 +362,21 @@ pub fn request_snapshot(
         Error::Conflict(format!("task {task_id} is running but assigned to no node"))
     })?;
     let id = SnapshotId::generate();
-    inner.snapshots.insert(
-        id.clone(),
-        SnapshotRecord {
-            id: id.clone(),
-            task_id: task_id.clone(),
-            node_id,
-            spec: SnapshotSpec {
-                snapshot_type: req.snapshot_type,
-                mem_file_path: req.mem_file_path.clone().unwrap_or_default(),
-                snapshot_path: req.snapshot_path.clone().unwrap_or_default(),
-            },
-            state: SnapshotState::Requested,
-            error: None,
-            created_at: now,
+    let record = SnapshotRecord {
+        id: id.clone(),
+        task_id: task_id.clone(),
+        node_id,
+        spec: SnapshotSpec {
+            snapshot_type: req.snapshot_type,
+            mem_file_path: req.mem_file_path.clone().unwrap_or_default(),
+            snapshot_path: req.snapshot_path.clone().unwrap_or_default(),
         },
-    );
+        state: SnapshotState::Requested,
+        error: None,
+        created_at: now,
+    };
+    inner.snapshots.insert(id.clone(), record.clone());
+    journal_op(inner, &JournalOp::RequestSnapshot { record }).map_err(|e| journal_err(&e))?;
     Ok(id)
 }
 
@@ -360,6 +477,15 @@ pub fn report_snapshot_result(
     if let Some(path) = &result.snapshot_path {
         record.spec.snapshot_path.clone_from(path);
     }
+    journal_op(
+        inner,
+        &JournalOp::ReportSnapshot {
+            task_id: task_id.clone(),
+            snapshot_id: snapshot_id.clone(),
+            result: result.clone(),
+        },
+    )
+    .map_err(|e| journal_err(&e))?;
     Ok(())
 }
 
@@ -383,8 +509,11 @@ pub fn push_logs(inner: &mut StateInner, id: &TaskId, lines: &[String]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bigtop_core::{NetworkSpec, SnapshotPolicy, SnapshotType, TaskSpec, VmSpec};
+    use bigtop_core::{
+        NetworkAssignment, NetworkSpec, ServiceSpec, SnapshotPolicy, SnapshotType, TaskSpec, VmSpec,
+    };
     use std::collections::HashMap;
+    use std::net::Ipv4Addr;
 
     fn job_spec(count: u32) -> JobSpec {
         JobSpec {
@@ -407,6 +536,7 @@ mod tests {
                 node_affinity: None,
                 snapshot_policy: SnapshotPolicy::None,
                 network: NetworkSpec::default(),
+                service: ServiceSpec::default(),
             }],
         }
     }
@@ -491,7 +621,8 @@ mod tests {
     #[test]
     fn heartbeat_rejects_unknown_node() {
         let mut inner = StateInner::default();
-        let err = heartbeat(&mut inner, &NodeId::generate(), Utc::now()).expect_err("not found");
+        let err =
+            heartbeat(&mut inner, &NodeId::generate(), None, Utc::now()).expect_err("not found");
         assert!(matches!(err, Error::NotFound(_)));
     }
 
@@ -664,5 +795,76 @@ mod tests {
         assert_eq!(record.state, SnapshotState::Failed);
         assert!(record.state.is_terminal());
         assert_eq!(record.error.as_deref(), Some("firecracker refused"));
+    }
+
+    fn assigned_running_task(
+        inner: &mut StateInner,
+        name: &str,
+        service_name: Option<&str>,
+        ip: Ipv4Addr,
+    ) -> TaskId {
+        let mut spec = job_spec(1).tasks.into_iter().next().expect("task spec");
+        spec.name = name.to_string();
+        if let Some(service_name) = service_name {
+            spec.service.name = Some(service_name.to_string());
+        }
+        let task_id = TaskId::generate();
+        inner.tasks.insert(
+            task_id.clone(),
+            Task {
+                id: task_id.clone(),
+                job_id: JobId::generate(),
+                name: name.to_string(),
+                spec,
+                state: TaskState::Running,
+                assigned_node: Some(NodeId::from("node-1".to_string())),
+                network: Some(NetworkAssignment {
+                    ip,
+                    gateway: Ipv4Addr::new(172, 28, 0, 1),
+                    netmask: Ipv4Addr::new(255, 255, 255, 0),
+                }),
+                exit_code: None,
+            },
+        );
+        task_id
+    }
+
+    #[test]
+    fn service_endpoints_lists_only_running_tasks_with_ips() {
+        let mut inner = StateInner::default();
+        let ip = |n: u8| Ipv4Addr::new(172, 28, 0, n);
+
+        let web1 = assigned_running_task(&mut inner, "web-1", Some("web"), ip(2));
+        let web2 = assigned_running_task(&mut inner, "web-2", Some("web"), ip(3));
+        let _db = assigned_running_task(&mut inner, "db-1", Some("db"), ip(4));
+        // No service name: never listed.
+        let _plain = assigned_running_task(&mut inner, "plain", None, ip(5));
+        // Not running: not listed.
+        let pending = assigned_running_task(&mut inner, "web-3", Some("web"), ip(6));
+        inner.tasks.get_mut(&pending).expect("task").state = TaskState::Pending;
+        // Running but no network assignment: not listed.
+        let noip = assigned_running_task(&mut inner, "web-4", Some("web"), ip(7));
+        inner.tasks.get_mut(&noip).expect("task").network = None;
+
+        let services = service_endpoints(&inner);
+        assert_eq!(services.len(), 2);
+        assert_eq!(services[0].name, "db");
+        assert_eq!(services[0].endpoints.len(), 1);
+        assert_eq!(services[1].name, "web");
+        let web_ips: Vec<Ipv4Addr> = services[1].endpoints.iter().map(|e| e.ip).collect();
+        assert_eq!(web_ips, vec![ip(2), ip(3)]);
+        let web_task_ids: Vec<TaskId> = services[1]
+            .endpoints
+            .iter()
+            .map(|e| e.task_id.clone())
+            .collect();
+        assert!(web_task_ids.contains(&web1) && web_task_ids.contains(&web2));
+
+        // Terminal transition removes the endpoint.
+        set_task_state(&mut inner, &web1, TaskState::Succeeded, Some(0)).expect("succeed");
+        let services = service_endpoints(&inner);
+        let web = services.iter().find(|s| s.name == "web").expect("web");
+        assert_eq!(web.endpoints.len(), 1);
+        assert_eq!(web.endpoints[0].task_id, web2);
     }
 }

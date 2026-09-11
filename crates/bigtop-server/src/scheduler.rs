@@ -11,21 +11,37 @@
 //!    determinism.
 
 use crate::ipam::Ipam;
-use crate::state::StateInner;
-use bigtop_core::{NetworkAssignment, NodeId, NodeInfo, Resources, Task, TaskId, TaskState};
+use crate::journal::JournalOp;
+use crate::state::{journal_err, journal_op, StateInner};
+use bigtop_core::{Error, NetworkAssignment, NodeId, NodeInfo, Resources, Task, TaskId, TaskState};
 use chrono::{DateTime, Utc};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::net::Ipv4Addr;
 
 /// Run one scheduling pass over the cluster state.
-pub fn tick(inner: &mut StateInner, now: DateTime<Utc>) {
-    requeue_dead_nodes(inner, now);
+///
+/// Every mutation in the pass is journaled and fsynced; a journal
+/// failure aborts the pass with [`Error::Persistence`]. Mutations
+/// already applied stay applied in memory — the error tells the caller
+/// they are not guaranteed to survive a crash.
+///
+/// # Errors
+///
+/// Returns [`Error::Persistence`] when a journal append fails.
+pub fn tick(inner: &mut StateInner, now: DateTime<Utc>) -> Result<(), Error> {
+    requeue_dead_nodes(inner, now)?;
     recount_used(inner);
-    place_pending(inner, now);
+    place_pending(inner, now)?;
+    Ok(())
 }
 
 /// Return `Pending` any task whose node stopped heartbeating.
-fn requeue_dead_nodes(inner: &mut StateInner, now: DateTime<Utc>) {
+///
+/// # Errors
+///
+/// Returns [`Error::Persistence`] when a journal append fails.
+fn requeue_dead_nodes(inner: &mut StateInner, now: DateTime<Utc>) -> Result<(), Error> {
     let dead: Vec<NodeId> = inner
         .nodes
         .values()
@@ -33,26 +49,45 @@ fn requeue_dead_nodes(inner: &mut StateInner, now: DateTime<Utc>) {
         .map(|node| node.id.clone())
         .collect();
     if dead.is_empty() {
-        return;
+        return Ok(());
     }
-    for task in inner.tasks.values_mut() {
-        let orphaned = matches!(task.state, TaskState::Assigned | TaskState::Running)
-            && task
-                .assigned_node
-                .as_ref()
-                .is_some_and(|id| dead.contains(id));
-        if orphaned {
+    let orphans: Vec<TaskId> = inner
+        .tasks
+        .values()
+        .filter(|task| {
+            matches!(task.state, TaskState::Assigned | TaskState::Running)
+                && task
+                    .assigned_node
+                    .as_ref()
+                    .is_some_and(|id| dead.contains(id))
+        })
+        .map(|task| task.id.clone())
+        .collect();
+    for id in orphans {
+        if let Some(task) = inner.tasks.get_mut(&id) {
             task.state = TaskState::Pending;
             task.assigned_node = None;
             // The dead node's subnet is gone: free the IP and the assignment.
-            let _ = inner.ipam.release(&task.id);
             task.network = None;
         }
+        if inner.ipam.release(&id) {
+            journal_op(
+                inner,
+                &JournalOp::IpamRelease {
+                    task_id: id.clone(),
+                },
+            )
+            .map_err(|e| journal_err(&e))?;
+        }
+        journal_op(inner, &JournalOp::TaskRequeued { task_id: id }).map_err(|e| journal_err(&e))?;
     }
+    Ok(())
 }
 
 /// Recompute `used` from tasks that currently hold resources.
-fn recount_used(inner: &mut StateInner) {
+///
+/// `pub` so journal replay can rebuild the same accounting.
+pub fn recount_used(inner: &mut StateInner) {
     for node in inner.nodes.values_mut() {
         node.used = Resources::default();
     }
@@ -74,7 +109,11 @@ fn recount_used(inner: &mut StateInner) {
 }
 
 /// Place every pending task, least-loaded fit, deterministic order.
-fn place_pending(inner: &mut StateInner, now: DateTime<Utc>) {
+///
+/// # Errors
+///
+/// Returns [`Error::Persistence`] when a journal append fails.
+fn place_pending(inner: &mut StateInner, now: DateTime<Utc>) -> Result<(), Error> {
     let mut pending: Vec<TaskId> = inner
         .tasks
         .iter()
@@ -93,13 +132,16 @@ fn place_pending(inner: &mut StateInner, now: DateTime<Utc>) {
         // Network-enabled tasks get an IP on the chosen node's /24. When
         // the address space is exhausted the task stays Pending for a
         // later tick.
+        let mut allocated_ip: Option<Ipv4Addr> = None;
         let network = if task.spec.network.enabled {
             let Some(ip) = inner.ipam.allocate(&node_id, &task_id) else {
                 continue;
             };
             let Some(gateway) = inner.ipam.gateway_for(&node_id) else {
+                let _ = inner.ipam.release(&task_id);
                 continue;
             };
+            allocated_ip = Some(ip);
             Some(NetworkAssignment {
                 ip,
                 gateway,
@@ -108,18 +150,84 @@ fn place_pending(inner: &mut StateInner, now: DateTime<Utc>) {
         } else {
             None
         };
+        // Service discovery (v0.4): inject the current endpoints of every
+        // service this task wants to discover.
+        let services_env = services_env_for(inner, &task);
         let placed = match (inner.tasks.get_mut(&task_id), inner.nodes.get_mut(&node_id)) {
             (Some(task), Some(node)) => {
                 task.state = TaskState::Assigned;
                 task.assigned_node = Some(node.id.clone());
                 task.network = network;
+                if let Some(env) = &services_env {
+                    task.spec
+                        .env
+                        .insert("BIGTOP_SERVICES".to_string(), env.clone());
+                }
                 node.used = node.used.saturating_add(task.spec.resources);
                 true
             }
             _ => false,
         };
-        let _ = placed;
+        if placed {
+            if let Some(ip) = allocated_ip {
+                journal_op(
+                    inner,
+                    &JournalOp::IpamAllocate {
+                        node_id: node_id.clone(),
+                        task_id: task_id.clone(),
+                        ip,
+                    },
+                )
+                .map_err(|e| journal_err(&e))?;
+            }
+            journal_op(
+                inner,
+                &JournalOp::TaskAssigned {
+                    task_id,
+                    node_id,
+                    network,
+                    services_env,
+                },
+            )
+            .map_err(|e| journal_err(&e))?;
+        } else if allocated_ip.is_some() {
+            // Defensive rollback: the address was allocated but the task
+            // could not be placed.
+            let _ = inner.ipam.release(&task_id);
+        }
     }
+    Ok(())
+}
+
+/// The `BIGTOP_SERVICES` value for a task: JSON mapping each discovered
+/// service name to its current endpoint IPs (sorted). `None` when the
+/// task discovers nothing.
+fn services_env_for(inner: &StateInner, task: &Task) -> Option<String> {
+    if task.spec.service.discover.is_empty() {
+        return None;
+    }
+    let mut by_name: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for other in inner.tasks.values() {
+        let (Some(name), Some(network)) =
+            (other.spec.service.name.as_ref(), other.network.as_ref())
+        else {
+            continue;
+        };
+        if other.state != TaskState::Running {
+            continue;
+        }
+        by_name
+            .entry(name.as_str())
+            .or_default()
+            .push(network.ip.to_string());
+    }
+    let mut map: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for name in &task.spec.service.discover {
+        let mut ips = by_name.get(name.as_str()).cloned().unwrap_or_default();
+        ips.sort();
+        map.insert(name.as_str(), ips);
+    }
+    serde_json::to_string(&map).ok()
 }
 
 /// The alive node with the lowest load that fits the task, if any.
@@ -163,7 +271,9 @@ fn cmp_load(a: &NodeInfo, b: &NodeInfo) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bigtop_core::{JobId, NetworkSpec, NodeId, SnapshotPolicy, Task, TaskSpec, VmSpec};
+    use bigtop_core::{
+        JobId, NetworkSpec, NodeId, ServiceSpec, SnapshotPolicy, Task, TaskSpec, VmSpec,
+    };
     use std::collections::HashMap;
 
     fn node(id: &str, cpu: u64, mem: u64, now: DateTime<Utc>) -> NodeInfo {
@@ -171,6 +281,7 @@ mod tests {
             id: NodeId::from(id.to_string()),
             name: id.to_string(),
             addr: "127.0.0.1".to_string(),
+            underlay_ip: None,
             total: Resources {
                 cpu_millis: cpu,
                 mem_mb: mem,
@@ -206,6 +317,7 @@ mod tests {
                 node_affinity: None,
                 snapshot_policy: SnapshotPolicy::None,
                 network: NetworkSpec::default(),
+                service: ServiceSpec::default(),
             },
             state: TaskState::Pending,
             assigned_node: None,
@@ -250,7 +362,7 @@ mod tests {
             let t = task(&format!("task-{i}"), 400, 64);
             inner.tasks.insert(t.id.clone(), t);
         }
-        tick(&mut inner, now);
+        tick(&mut inner, now).expect("tick");
         let got = assignments(&inner);
         // task-0 -> a (tie, lower id), task-1 -> b (a is busier),
         // task-2 -> a (tie again), task-3 -> b.
@@ -269,7 +381,7 @@ mod tests {
         let mut inner = cluster(now);
         let t = task("task-big", 9999, 64);
         inner.tasks.insert(t.id.clone(), t);
-        tick(&mut inner, now);
+        tick(&mut inner, now).expect("tick");
         let task = inner
             .tasks
             .get(&TaskId::from("task-big".to_string()))
@@ -286,7 +398,7 @@ mod tests {
         let mut t = task("task-pinned", 100, 64);
         t.spec.node_affinity = Some(NodeId::from("node-b".to_string()));
         inner.tasks.insert(t.id.clone(), t);
-        tick(&mut inner, now);
+        tick(&mut inner, now).expect("tick");
         let task = inner
             .tasks
             .get(&TaskId::from("task-pinned".to_string()))
@@ -302,7 +414,7 @@ mod tests {
         let mut t = task("task-lost", 100, 64);
         t.spec.node_affinity = Some(NodeId::from("node-gone".to_string()));
         inner.tasks.insert(t.id.clone(), t);
-        tick(&mut inner, now);
+        tick(&mut inner, now).expect("tick");
         let task = inner
             .tasks
             .get(&TaskId::from("task-lost".to_string()))
@@ -333,7 +445,7 @@ mod tests {
         u.assigned_node = Some(NodeId::from("node-new".to_string()));
         inner.tasks.insert(u.id.clone(), u);
 
-        tick(&mut inner, now);
+        tick(&mut inner, now).expect("tick");
 
         // The orphan is requeued, then immediately placed on the live node.
         let orphan = inner
@@ -366,7 +478,7 @@ mod tests {
         t.assigned_node = Some(NodeId::from("node-old".to_string()));
         inner.tasks.insert(t.id.clone(), t);
 
-        tick(&mut inner, now);
+        tick(&mut inner, now).expect("tick");
 
         let orphan = inner
             .tasks
@@ -383,7 +495,7 @@ mod tests {
         let mut t = task("task-net", 100, 64);
         t.spec.network.enabled = true;
         inner.tasks.insert(t.id.clone(), t);
-        tick(&mut inner, now);
+        tick(&mut inner, now).expect("tick");
         let placed = inner
             .tasks
             .get(&TaskId::from("task-net".to_string()))
@@ -409,7 +521,7 @@ mod tests {
         let mut inner = cluster(now);
         let t = task("task-plain", 100, 64);
         inner.tasks.insert(t.id.clone(), t);
-        tick(&mut inner, now);
+        tick(&mut inner, now).expect("tick");
         let placed = inner
             .tasks
             .get(&TaskId::from("task-plain".to_string()))
@@ -443,7 +555,7 @@ mod tests {
         });
         inner.tasks.insert(t.id.clone(), t);
 
-        tick(&mut inner, now);
+        tick(&mut inner, now).expect("tick");
 
         let orphan = inner
             .tasks
@@ -476,7 +588,7 @@ mod tests {
         t.spec.network.enabled = true;
         inner.tasks.insert(t.id.clone(), t);
 
-        tick(&mut inner, now);
+        tick(&mut inner, now).expect("tick");
 
         let starved = inner
             .tasks
@@ -501,7 +613,7 @@ mod tests {
         }
         let t = task("task-1", 400, 64);
         inner.tasks.insert(t.id.clone(), t);
-        tick(&mut inner, now);
+        tick(&mut inner, now).expect("tick");
         for n in inner.nodes.values() {
             assert!(n.used.cpu_millis <= 400, "used: {:?}", n.used);
         }
@@ -525,5 +637,156 @@ mod tests {
         let zero = node("c", 0, 0, now);
         assert_eq!(cmp_load(&zero, &idle), Ordering::Greater);
         assert_eq!(cmp_load(&idle, &zero), Ordering::Less);
+    }
+
+    fn open_test_journal(name: &str) -> (crate::journal::JournalWriter, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("bigtop-sched-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create tmp dir");
+        let journal = crate::journal::open_journal(&dir).expect("open journal");
+        (journal, dir)
+    }
+
+    #[test]
+    fn tick_journals_assignment_and_ipam() {
+        let now = Utc::now();
+        let mut inner = cluster(now);
+        let (journal, dir) = open_test_journal("assign");
+        inner.journal = Some(journal);
+        let mut t = task("task-net", 100, 64);
+        t.spec.network.enabled = true;
+        inner.tasks.insert(t.id.clone(), t);
+
+        tick(&mut inner, now).expect("tick");
+
+        let ops = crate::journal::load_journal_ops(&dir).expect("load");
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, JournalOp::IpamAllocate { .. })),
+            "expected an IpamAllocate op, got {ops:?}"
+        );
+        let assigned = ops
+            .iter()
+            .find_map(|op| match op {
+                JournalOp::TaskAssigned {
+                    task_id,
+                    node_id,
+                    network,
+                    services_env,
+                } => Some((task_id, node_id, network, services_env)),
+                _ => None,
+            })
+            .expect("expected a TaskAssigned op");
+        assert_eq!(
+            assigned.0,
+            &TaskId::from("task-net".to_string()),
+            "assigned the right task"
+        );
+        assert!(assigned.2.is_some(), "network assignment journaled");
+        assert_eq!(assigned.3, &None, "no discover, no services env");
+        assert!(
+            ["node-a", "node-b"].contains(&assigned.1.to_string().as_str()),
+            "placed on a live node"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn requeue_journals_task_and_ip_release() {
+        let now = Utc::now();
+        let mut inner = StateInner::default();
+        inner.nodes.insert(
+            NodeId::from("node-old".to_string()),
+            node("node-old", 4000, 4096, now - chrono::Duration::seconds(30)),
+        );
+        let (journal, dir) = open_test_journal("requeue");
+        inner.journal = Some(journal);
+        let node_id = NodeId::from("node-old".to_string());
+        let mut t = task("task-orphan", 100, 64);
+        t.spec.network.enabled = true;
+        t.state = TaskState::Assigned;
+        t.assigned_node = Some(node_id.clone());
+        let ip = inner
+            .ipam
+            .allocate(&node_id, &t.id)
+            .expect("pre-allocation");
+        t.network = Some(NetworkAssignment {
+            ip,
+            gateway: inner.ipam.gateway_for(&node_id).expect("gateway"),
+            netmask: Ipam::netmask(),
+        });
+        inner.tasks.insert(t.id.clone(), t);
+
+        tick(&mut inner, now).expect("tick");
+
+        let ops = crate::journal::load_journal_ops(&dir).expect("load");
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                JournalOp::TaskRequeued { task_id }
+                if *task_id == TaskId::from("task-orphan".to_string())
+            )),
+            "expected TaskRequeued, got {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                JournalOp::IpamRelease { task_id }
+                if *task_id == TaskId::from("task-orphan".to_string())
+            )),
+            "expected IpamRelease, got {ops:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_injects_bigtop_services_env() {
+        use std::net::Ipv4Addr;
+        let now = Utc::now();
+        let mut inner = cluster(now);
+        // A running db task with a pod IP.
+        let node_id = NodeId::from("node-a".to_string());
+        let db_ip: Ipv4Addr = "172.28.0.2".parse().expect("ip");
+        let mut db = task("task-db", 100, 64);
+        db.spec.service.name = Some("db".to_string());
+        db.spec.network.enabled = true;
+        db.state = TaskState::Running;
+        db.assigned_node = Some(node_id);
+        db.network = Some(NetworkAssignment {
+            ip: db_ip,
+            gateway: "172.28.0.1".parse().expect("ip"),
+            netmask: Ipam::netmask(),
+        });
+        inner.tasks.insert(db.id.clone(), db);
+        // A pending web task that discovers db (and an unknown service).
+        let mut web = task("task-web", 100, 64);
+        web.spec.service.discover = vec!["db".to_string(), "cache".to_string()];
+        inner.tasks.insert(web.id.clone(), web);
+
+        tick(&mut inner, now).expect("tick");
+
+        let web = inner
+            .tasks
+            .get(&TaskId::from("task-web".to_string()))
+            .expect("web");
+        assert_eq!(web.state, TaskState::Assigned);
+        let env = web
+            .spec
+            .env
+            .get("BIGTOP_SERVICES")
+            .expect("BIGTOP_SERVICES injected");
+        let parsed: serde_json::Value = serde_json::from_str(env).expect("valid JSON");
+        assert_eq!(parsed["db"], serde_json::json!(["172.28.0.2"]));
+        assert_eq!(parsed["cache"], serde_json::json!([]));
+        // A task that discovers nothing gets no env var.
+        let mut inner2 = cluster(now);
+        let plain = task("task-plain", 100, 64);
+        inner2.tasks.insert(plain.id.clone(), plain);
+        tick(&mut inner2, now).expect("tick");
+        let plain = inner2
+            .tasks
+            .get(&TaskId::from("task-plain".to_string()))
+            .expect("plain");
+        assert_eq!(plain.spec.env.get("BIGTOP_SERVICES"), None);
     }
 }

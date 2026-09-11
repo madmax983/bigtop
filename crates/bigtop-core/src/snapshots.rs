@@ -211,6 +211,7 @@ mod tests {
                 node_affinity: None,
                 snapshot_policy: SnapshotPolicy::None,
                 network: crate::network::NetworkSpec::default(),
+                service: crate::network::ServiceSpec::default(),
             },
             state: TaskState::Running,
             assigned_node: Some(NodeId::from("node-9".to_string())),

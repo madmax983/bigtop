@@ -14,7 +14,7 @@ bigtop-agent = { path = "../bigtop-agent" }
 bigtop-core = { path = "../bigtop-core" }
 bigtop-server = { path = "../bigtop-server" }
 chrono = "0.4"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,4 +1,4 @@
-# BigTop v0.4 — Spec
+# BigTop v0.5 — Spec
 
 BigTop is a Firecracker-first orchestrator. Every workload is a microVM:
 the security of VMs with the speed of containers. One binary, opinionated,
@@ -6,10 +6,12 @@ loud. v0.1 "spark" shipped job submission, scheduling, and agents that boot
 microVMs. v0.2 hardened the Firecracker path: snapshot/restore, vsock log
 streaming, and `firecracker-jailer` sandboxing. v0.3 gave every task an
 identity on the wire: per-task taps, server IPAM, and a static guest
-network contract. v0.4 is **one big network, and it remembers**: a VXLAN
+network contract. v0.4 was **one big network, and it remembers**: a VXLAN
 cross-node overlay mesh, service discovery over the overlay, Prometheus
 metrics, and crash-safe server persistence — plus a tiny status page on
-top.
+top. v0.5 is **the framework and the bouncer**: the control plane is
+served through Autumn (typed routes, OpenAPI, MCP), and every
+control-plane route requires a bearer token.
 
 ## Terms
 
@@ -50,6 +52,35 @@ it do not join the overlay mesh.
 
 Job spec validation (`400 invalid job spec`): non-empty name, at least one
 task spec, non-empty command per spec, `count >= 1`.
+
+### Autumn + bearer auth (v0.5)
+
+The control plane is served through Autumn, but the wire behavior above
+is unchanged: same paths, same methods, same status codes, same bodies.
+Sixteen typed `/v1` handlers are Autumn routes (scoped under `/v1`);
+`/` (status page) and `/metrics` stay on a plain Axum router merged into
+the Autumn app. The 500 ms scheduler tick, the task state machine, IPAM,
+the JSONL journal/snapshots, the Firecracker agent, the vsock log
+bridge, tap handling, and the VXLAN overlay all stay outside Autumn's
+application logic.
+
+Every control-plane route requires
+`Authorization: Bearer <token>` — HTTP and MCP alike. The server takes
+the token from `--api-token` / `BIGTOP_API_TOKEN`; when neither is set it
+issues one at startup and prints it once (it cannot be recovered later).
+Agents and CLI clients take the same flag/env var. A bad or missing token
+gets `401`; the agent's error message says exactly how to fix it.
+
+Deliberate MCP exposure only: ten tools at `POST /mcp`
+(Streamable HTTP) — `submit_job`, `list_jobs`, `list_tasks`, `get_logs`,
+`list_nodes`, `list_services`, `assignments`, `overlay_peers`,
+`snapshot_requests`, `list_snapshots`. Nine are read-only; `submit_job`
+is a deliberate, documented mutation — it goes through the same
+bearer-token gate as every HTTP route, and a tokenless `tools/call`
+gets `401`. Mutating routes other than `submit_job`, the HTML status
+page, and `/metrics` are not tools. OpenAPI is served at
+`/openapi.json` (+ `/swagger-ui`) behind the same bearer token as the
+rest of the control plane; the MCP envelope itself is token-gated.
 
 ## TaskSpec
 
@@ -495,14 +526,18 @@ Unique per process; sortable; safe in env vars and shell.
 ## CLI
 
 ```
-bigtop server [--port 4667] [--bind 127.0.0.1] [--network-cidr 172.28.0.0/16] [--data-dir DIR]
-bigtop agent --server http://127.0.0.1:4667 [--name NAME] [--runtime auto] [--vm-dir DIR] [--firecracker-bin BIN] [--jailer] [--jailer-bin BIN] [--jailer-uid UID] [--jailer-gid GID] [--chroot-base-dir DIR] [--netns PATH] [--vni VNI] [--underlay-ip IP]
-bigtop run <job.toml> [--server URL]
-bigtop ps [--server URL]
-bigtop nodes [--server URL]
-bigtop services [--server URL]
-bigtop logs <task-id> [--server URL]
-bigtop snapshot create <task-id> [--kind full|diff] [--mem-path PATH] [--snap-path PATH] [--server URL]
-bigtop snapshot list <task-id> [--server URL]
-bigtop snapshot restore <task-id> <snapshot-id> [--server URL]
+bigtop [--api-token TOKEN] server [--port 4667] [--bind 127.0.0.1] [--network-cidr 172.28.0.0/16] [--data-dir DIR]
+bigtop [--api-token TOKEN] agent --server http://127.0.0.1:4667 [--name NAME] [--runtime auto] [--vm-dir DIR] [--firecracker-bin BIN] [--jailer] [--jailer-bin BIN] [--jailer-uid UID] [--jailer-gid GID] [--chroot-base-dir DIR] [--netns PATH] [--vni VNI] [--underlay-ip IP]
+bigtop [--api-token TOKEN] run <job.toml> [--server URL]
+bigtop [--api-token TOKEN] ps [--server URL]
+bigtop [--api-token TOKEN] nodes [--server URL]
+bigtop [--api-token TOKEN] services [--server URL]
+bigtop [--api-token TOKEN] logs <task-id> [--server URL]
+bigtop [--api-token TOKEN] snapshot create <task-id> [--kind full|diff] [--mem-path PATH] [--snap-path PATH] [--server URL]
+bigtop [--api-token TOKEN] snapshot list <task-id> [--server URL]
+bigtop [--api-token TOKEN] snapshot restore <task-id> <snapshot-id> [--server URL]
 ```
+
+`--api-token` is global (also `BIGTOP_API_TOKEN`); the flag wins. When the
+server starts without one it generates a token and prints it once — hand
+it to every agent and CLI via the flag or the env var.

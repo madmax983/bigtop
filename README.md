@@ -37,8 +37,10 @@ Crates:
 
 - `bigtop-core` — domain types (`JobId`/`TaskId`/`NodeId` newtypes,
   `TaskSpec` + `VmSpec`, `Task`, `NodeInfo`), wire DTOs, error type.
-- `bigtop-server` — axum REST API, in-memory store, scheduler
-  (least-loaded fit, dead-node requeue).
+- `bigtop-server` — control plane served through Autumn (`autumn-web 0.7`
+  from crates.io — a plain `git clone` builds with no local autumn
+  checkout), in-memory store, scheduler (least-loaded fit, dead-node
+  requeue), bearer-token auth on every route.
 - `bigtop-agent` — registers, heartbeats, polls assignments, runs tasks via
   `FirecrackerRuntime` (real microVMs) or `ProcessRuntime` (dev/CI).
 - `bigtop` — the CLI: `server`, `agent`, `run`, `ps`, `nodes`, `logs`,
@@ -48,6 +50,12 @@ Crates:
 
 ```bash
 cargo build --release
+
+# One bearer token for the whole control plane (v0.5+): the server, the
+# agent, and every CLI call read it from BIGTOP_API_TOKEN (or --api-token).
+# Skip it and the server issues one at startup and prints it once — it
+# cannot be recovered later, so set your own.
+export BIGTOP_API_TOKEN="dev-token-change-me"
 
 # Terminal 1: the server
 ./target/release/bigtop server --port 4667
@@ -61,6 +69,10 @@ cargo build --release
 ./target/release/bigtop nodes
 ./target/release/bigtop logs <task-id>
 ```
+
+Every control-plane route — REST, `/metrics`, the status page, OpenAPI,
+and MCP — requires `Authorization: Bearer $BIGTOP_API_TOKEN` and answers
+`401` without it.
 
 On a machine with `/dev/kvm` and a `firecracker` binary, point
 `examples/hello.toml`'s `[task.vm]` at a real kernel + rootfs and each
@@ -232,6 +244,7 @@ agent logs what it skipped).
 ## Persistence (v0.4)
 
 ```bash
+# BIGTOP_API_TOKEN (or --api-token) still required — see Quickstart.
 bigtop server --port 4667 --data-dir ./bigtop-data
 ```
 

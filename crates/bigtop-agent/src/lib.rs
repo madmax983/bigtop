@@ -89,6 +89,10 @@ pub struct AgentConfig {
     /// VXLAN network identifier for the cross-node overlay (v0.4).
     /// `None` disables the overlay (no host networking changes).
     pub overlay_vni: Option<u32>,
+    /// Bearer token for the control plane (v0.5). `None` means the server
+    /// does not require auth — which it always does, so the first request
+    /// will fail with a 401 hint.
+    pub api_token: Option<String>,
 }
 
 impl AgentConfig {
@@ -103,6 +107,7 @@ impl AgentConfig {
             poll_interval: Duration::from_secs(1),
             underlay_ip: None,
             overlay_vni: None,
+            api_token: None,
         }
     }
 }
@@ -165,7 +170,7 @@ type SnapshotClaims = Arc<std::sync::Mutex<HashSet<SnapshotId>>>;
 /// Returns [`AgentError`] if registration keeps failing, the overlay
 /// flags are inconsistent, or overlay setup fails.
 pub async fn run_agent(config: AgentConfig, runtime: RuntimeKind) -> Result<(), AgentError> {
-    let client = reqwest::Client::new();
+    let client = build_client(config.api_token.as_deref())?;
     let node_id = register_with_retry(&client, &config).await?;
     // VXLAN overlay (v0.4): fail fast on inconsistent flags, then build
     // the device/bridge before any task boots.
@@ -817,6 +822,27 @@ async fn post_json(
     check_ok(response).await
 }
 
+/// Build the agent's HTTP client, injecting the bearer token (v0.5) as a
+/// default `Authorization` header so every control-plane call carries it.
+///
+/// # Errors
+///
+/// Returns [`AgentError::Config`] when the token is not a valid header
+/// value, or [`AgentError::Http`] when the client cannot be built.
+fn build_client(api_token: Option<&str>) -> Result<reqwest::Client, AgentError> {
+    let mut builder = reqwest::Client::builder();
+    if let Some(token) = api_token {
+        let value: reqwest::header::HeaderValue =
+            format!("Bearer {token}").parse().map_err(|_| {
+                AgentError::Config("API token is not a valid HTTP header value".to_string())
+            })?;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+        builder = builder.default_headers(headers);
+    }
+    Ok(builder.build()?)
+}
+
 /// Map non-2xx responses to [`AgentError::Server`].
 async fn check_ok(response: reqwest::Response) -> Result<reqwest::Response, AgentError> {
     if response.status().is_success() {
@@ -824,6 +850,11 @@ async fn check_ok(response: reqwest::Response) -> Result<reqwest::Response, Agen
     } else {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(AgentError::Server(format!(
+                "{status}: {text} (bad or missing API token; pass --api-token or BIGTOP_API_TOKEN)"
+            )));
+        }
         Err(AgentError::Server(format!("{status}: {text}")))
     }
 }

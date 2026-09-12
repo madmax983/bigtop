@@ -16,6 +16,22 @@ use std::path::{Path, PathBuf};
 /// Default server URL for CLI commands.
 const DEFAULT_SERVER: &str = "http://127.0.0.1:4667";
 
+/// HTTP client for CLI control-plane calls, carrying the bearer token
+/// from `--api-token` / `BIGTOP_API_TOKEN` as an `Authorization` header
+/// (v0.5). Works without a token too — the server answers 401.
+fn api_client() -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder();
+    if let Ok(token) = std::env::var("BIGTOP_API_TOKEN") {
+        let value: reqwest::header::HeaderValue = format!("Bearer {token}")
+            .parse()
+            .context("BIGTOP_API_TOKEN is not a valid HTTP header value")?;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+        builder = builder.default_headers(headers);
+    }
+    Ok(builder.build()?)
+}
+
 /// Column headers for `bigtop ps`.
 const PS_HEADERS: [&str; 7] = ["TASK ID", "NAME", "STATE", "EXIT", "NODE", "IP", "JOB"];
 /// Column headers for `bigtop nodes`.
@@ -34,6 +50,11 @@ const NODES_HEADERS: [&str; 5] = [
     about = "BigTop: the loud, fast, opinionated microVM orchestrator. One binary."
 )]
 struct Cli {
+    /// Bearer token for the control plane (v0.5). Every server, agent,
+    /// and CLI call needs the same token; the flag wins over the env var.
+    #[arg(long, global = true, env = "BIGTOP_API_TOKEN")]
+    api_token: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -213,13 +234,20 @@ struct JobFile {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // The read-only CLI clients build their auth header from the env var;
+    // seeding it here keeps `--api-token` working for every subcommand
+    // without threading the token through each handler.
+    if let Some(token) = &cli.api_token {
+        std::env::set_var("BIGTOP_API_TOKEN", token);
+    }
+    let api_token = cli.api_token.clone();
     match cli.command {
         Commands::Server {
             port,
             bind,
             network_cidr,
             data_dir,
-        } => cmd_server(&bind, port, &network_cidr, data_dir).await,
+        } => cmd_server(&bind, port, &network_cidr, data_dir, api_token).await,
         Commands::Agent {
             server,
             name,
@@ -249,6 +277,7 @@ async fn main() -> Result<()> {
                 netns,
                 vni,
                 underlay_ip,
+                api_token,
             })
             .await
         }
@@ -291,23 +320,21 @@ async fn cmd_server(
     port: u16,
     network_cidr: &str,
     data_dir: Option<PathBuf>,
+    api_token: Option<String>,
 ) -> Result<()> {
-    let addr: std::net::SocketAddr = format!("{bind}:{port}")
-        .parse()
-        .context("invalid bind address")?;
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .context("binding server socket")?;
-    println!("bigtop server: listening on {addr} (loud and proud)");
+    println!("bigtop server: listening on {bind}:{port} (loud and proud)");
     if let Some(dir) = &data_dir {
         println!("bigtop server: persisting to {}", dir.display());
     }
     let config = ServerConfig {
+        bind_host: bind.to_string(),
+        bind_port: port,
+        api_token,
         tick_interval: std::time::Duration::from_millis(500),
         network_cidr: network_cidr.to_string(),
         data_dir,
     };
-    serve_config(listener, config).await?;
+    serve_config(config).await?;
     Ok(())
 }
 
@@ -326,6 +353,7 @@ struct AgentOptions<'a> {
     netns: Option<PathBuf>,
     vni: Option<u32>,
     underlay_ip: Option<Ipv4Addr>,
+    api_token: Option<String>,
 }
 
 async fn cmd_agent(opts: AgentOptions<'_>) -> Result<()> {
@@ -376,6 +404,7 @@ async fn cmd_agent(opts: AgentOptions<'_>) -> Result<()> {
     let mut agent_config = AgentConfig::new(opts.server.to_string(), name);
     agent_config.underlay_ip = opts.underlay_ip;
     agent_config.overlay_vni = opts.vni;
+    agent_config.api_token = opts.api_token;
     run_agent(agent_config, kind).await?;
     Ok(())
 }
@@ -388,7 +417,7 @@ async fn cmd_run(job_file: &Path, server: &str) -> Result<()> {
         name: file.name,
         tasks: file.task,
     };
-    let client = reqwest::Client::new();
+    let client = api_client()?;
     let response: bigtop_core::SubmitJobResponse = client
         .post(format!("{server}/v1/jobs"))
         .json(&spec)
@@ -497,7 +526,7 @@ async fn cmd_snapshot_create(
         mem_file_path: mem_path.map(str::to_string),
         snapshot_path: snap_path.map(str::to_string),
     };
-    let client = reqwest::Client::new();
+    let client = api_client()?;
     let response: bigtop_core::RequestSnapshotResponse = client
         .post(format!("{server}/v1/tasks/{task_id}/snapshot"))
         .json(&request)
@@ -567,7 +596,7 @@ async fn cmd_snapshot_restore(task_id: &str, snapshot_id: &str, server: &str) ->
         name: format!("restore-{}", task.name),
         tasks: vec![spec],
     };
-    let client = reqwest::Client::new();
+    let client = api_client()?;
     let response: bigtop_core::SubmitJobResponse = client
         .post(format!("{server}/v1/jobs"))
         .json(&job)
@@ -590,7 +619,7 @@ async fn get_json<T>(server: &str, path: &str) -> Result<T>
 where
     T: serde::de::DeserializeOwned,
 {
-    let client = reqwest::Client::new();
+    let client = api_client()?;
     client
         .get(format!("{server}{path}"))
         .send()

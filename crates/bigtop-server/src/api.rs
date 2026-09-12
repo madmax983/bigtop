@@ -1,12 +1,17 @@
 //! The `REST` API (v1).
+//!
+//! v0.5: the control plane is served through Autumn. The sixteen typed `/v1`
+//! handlers are Autumn routes scoped under `/v1` behind bearer-token auth;
+//! the two edge routes (`/`, `/metrics`) are typed Autumn routes registered
+//! globally through `.routes()`. Wire behavior is unchanged.
 
 use crate::state::{self, AppState, StateInner};
+use autumn_web::{get, post, routes, Route};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
-    Json, Router,
+    Extension, Json,
 };
 use bigtop_core::{
     api::{
@@ -22,29 +27,43 @@ use serde::Deserialize;
 use serde_json::json;
 use std::fmt::Write as _;
 
-/// Build the v1 router. (`Router` is already `#[must_use]`.)
-pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(status_page))
-        .route("/metrics", get(metrics))
-        .route("/v1/jobs", post(submit_job).get(list_jobs))
-        .route("/v1/tasks", get(list_tasks))
-        .route("/v1/tasks/{id}/state", post(set_task_state))
-        .route("/v1/tasks/{id}/logs", post(push_logs).get(get_logs))
-        .route("/v1/nodes", get(list_nodes))
-        .route("/v1/nodes/register", post(register_node))
-        .route("/v1/nodes/{id}/heartbeat", post(heartbeat))
-        .route("/v1/services", get(list_services))
-        .route("/v1/agents/assignments", get(assignments))
-        .route("/v1/agents/overlay-peers", get(overlay_peers))
-        .route("/v1/agents/snapshot-requests", get(snapshot_requests))
-        .route("/v1/tasks/{id}/snapshot", post(request_snapshot))
-        .route("/v1/tasks/{id}/snapshots", get(list_snapshots))
-        .route(
-            "/v1/tasks/{id}/snapshots/{snapshot_id}/result",
-            post(report_snapshot_result),
-        )
-        .with_state(state)
+/// Build the edge routes.
+///
+/// The status page and Prometheus metrics as typed Autumn routes, registered
+/// globally (not under the `/v1` scope). They are typed handlers exactly
+/// like the `/v1` ones: Autumn's startup validation only counts routes
+/// registered through `.routes()` — `.scoped()` groups and `.merge()`d raw
+/// routers do not satisfy it, so a scoped-only app panics at boot with "No
+/// routes registered". Auth comes from the app's global token layer and
+/// `Extension<AppState>` from the app's global extension layer, matching
+/// what the old merged Axum router installed.
+#[must_use]
+pub fn root_routes() -> Vec<Route> {
+    routes![status_page, metrics]
+}
+
+/// The sixteen typed `/v1` handlers as Autumn routes, mounted under the
+/// `/v1` scope in the app builder.
+#[must_use]
+pub fn autumn_routes() -> Vec<Route> {
+    routes![
+        submit_job,
+        list_jobs,
+        list_tasks,
+        set_task_state,
+        push_logs,
+        get_logs,
+        list_nodes,
+        register_node,
+        heartbeat,
+        list_services,
+        assignments,
+        overlay_peers,
+        snapshot_requests,
+        request_snapshot,
+        list_snapshots,
+        report_snapshot_result,
+    ]
 }
 
 /// Maps [`Error`] to an HTTP status plus a JSON error body.
@@ -63,10 +82,16 @@ impl IntoResponse for ApiError {
     }
 }
 
+#[post("/jobs")]
+#[api_doc(
+    mcp,
+    tag = "jobs",
+    summary = "Submit a job spec; the scheduler fans it out into tasks"
+)]
 async fn submit_job(
-    State(state): State<AppState>,
+    Extension(state): Extension<AppState>,
     Json(spec): Json<JobSpec>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<(StatusCode, Json<SubmitJobResponse>), ApiError> {
     let job_id = {
         let mut inner = state.inner.write().await;
         state::create_job(&mut inner, &spec, Utc::now()).map_err(ApiError)?
@@ -74,7 +99,13 @@ async fn submit_job(
     Ok((StatusCode::CREATED, Json(SubmitJobResponse { job_id })))
 }
 
-async fn list_jobs(State(state): State<AppState>) -> Json<Vec<JobSummary>> {
+#[get("/jobs")]
+#[api_doc(
+    mcp,
+    tag = "jobs",
+    summary = "List all submitted jobs with task counts"
+)]
+async fn list_jobs(Extension(state): Extension<AppState>) -> Json<Vec<JobSummary>> {
     let mut jobs: Vec<JobSummary> = {
         let inner = state.inner.read().await;
         inner
@@ -96,7 +127,9 @@ async fn list_jobs(State(state): State<AppState>) -> Json<Vec<JobSummary>> {
     Json(jobs)
 }
 
-async fn list_tasks(State(state): State<AppState>) -> Json<Vec<Task>> {
+#[get("/tasks")]
+#[api_doc(mcp, tag = "tasks", summary = "List every task across all jobs")]
+async fn list_tasks(Extension(state): Extension<AppState>) -> Json<Vec<Task>> {
     let mut tasks: Vec<Task> = {
         let inner = state.inner.read().await;
         inner.tasks.values().cloned().collect()
@@ -105,7 +138,9 @@ async fn list_tasks(State(state): State<AppState>) -> Json<Vec<Task>> {
     Json(tasks)
 }
 
-async fn list_nodes(State(state): State<AppState>) -> Json<Vec<NodeInfo>> {
+#[get("/nodes")]
+#[api_doc(mcp, tag = "nodes", summary = "List every registered agent node")]
+async fn list_nodes(Extension(state): Extension<AppState>) -> Json<Vec<NodeInfo>> {
     let mut nodes: Vec<NodeInfo> = {
         let inner = state.inner.read().await;
         inner.nodes.values().cloned().collect()
@@ -114,10 +149,12 @@ async fn list_nodes(State(state): State<AppState>) -> Json<Vec<NodeInfo>> {
     Json(nodes)
 }
 
+#[post("/nodes/register")]
+#[api_doc(tag = "nodes", summary = "Register an agent node (agent handshake)")]
 async fn register_node(
-    State(state): State<AppState>,
+    Extension(state): Extension<AppState>,
     Json(req): Json<RegisterNodeRequest>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<(StatusCode, Json<RegisterNodeResponse>), ApiError> {
     let id = {
         let mut inner = state.inner.write().await;
         state::register_node(
@@ -133,11 +170,13 @@ async fn register_node(
     Ok((StatusCode::CREATED, Json(RegisterNodeResponse { id })))
 }
 
+#[post("/nodes/{id}/heartbeat")]
+#[api_doc(tag = "nodes", summary = "Agent heartbeat; refreshes liveness")]
 async fn heartbeat(
-    State(state): State<AppState>,
+    Extension(state): Extension<AppState>,
     Path(id): Path<NodeId>,
     body: Option<Json<HeartbeatRequest>>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     {
         let mut inner = state.inner.write().await;
         let underlay_ip = body.and_then(|b| b.underlay_ip);
@@ -151,8 +190,14 @@ struct AssignmentsQuery {
     node_id: NodeId,
 }
 
+#[get("/agents/assignments")]
+#[api_doc(
+    mcp,
+    tag = "agents",
+    summary = "Tasks assigned to a node but not yet picked up"
+)]
 async fn assignments(
-    State(state): State<AppState>,
+    Extension(state): Extension<AppState>,
     Query(query): Query<AssignmentsQuery>,
 ) -> Json<Vec<Task>> {
     let mut tasks: Vec<Task> = {
@@ -170,11 +215,13 @@ async fn assignments(
     Json(tasks)
 }
 
+#[post("/tasks/{id}/state")]
+#[api_doc(tag = "tasks", summary = "Report a task state transition (agent)")]
 async fn set_task_state(
-    State(state): State<AppState>,
+    Extension(state): Extension<AppState>,
     Path(id): Path<TaskId>,
     Json(req): Json<SetTaskStateRequest>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     {
         let mut inner = state.inner.write().await;
         state::set_task_state(&mut inner, &id, req.state, req.exit_code).map_err(ApiError)?;
@@ -182,11 +229,13 @@ async fn set_task_state(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[post("/tasks/{id}/logs")]
+#[api_doc(tag = "tasks", summary = "Append log lines to a task (agent)")]
 async fn push_logs(
-    State(state): State<AppState>,
+    Extension(state): Extension<AppState>,
     Path(id): Path<TaskId>,
     Json(req): Json<PushLogsRequest>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     {
         let mut inner = state.inner.write().await;
         state::push_logs(&mut inner, &id, &req.lines).map_err(ApiError)?;
@@ -194,10 +243,12 @@ async fn push_logs(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[get("/tasks/{id}/logs")]
+#[api_doc(mcp, tag = "tasks", summary = "Fetch a task's buffered log lines")]
 async fn get_logs(
-    State(state): State<AppState>,
+    Extension(state): Extension<AppState>,
     Path(id): Path<TaskId>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Json<LogLinesResponse>, ApiError> {
     let lines = {
         let inner = state.inner.read().await;
         inner
@@ -211,11 +262,13 @@ async fn get_logs(
     Ok(Json(LogLinesResponse { lines }))
 }
 
+#[post("/tasks/{id}/snapshot")]
+#[api_doc(tag = "snapshots", summary = "Request a snapshot of a task")]
 async fn request_snapshot(
-    State(state): State<AppState>,
+    Extension(state): Extension<AppState>,
     Path(id): Path<TaskId>,
     Json(req): Json<RequestSnapshotRequest>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<(StatusCode, Json<RequestSnapshotResponse>), ApiError> {
     let snapshot_id = {
         let mut inner = state.inner.write().await;
         state::request_snapshot(&mut inner, &id, &req, Utc::now()).map_err(ApiError)?
@@ -226,8 +279,10 @@ async fn request_snapshot(
     ))
 }
 
+#[get("/tasks/{id}/snapshots")]
+#[api_doc(mcp, tag = "snapshots", summary = "List a task's snapshot records")]
 async fn list_snapshots(
-    State(state): State<AppState>,
+    Extension(state): Extension<AppState>,
     Path(id): Path<TaskId>,
 ) -> Result<Json<Vec<SnapshotRecord>>, ApiError> {
     let records = {
@@ -242,19 +297,27 @@ struct SnapshotRequestsQuery {
     node_id: NodeId,
 }
 
+#[get("/agents/snapshot-requests")]
+#[api_doc(
+    mcp,
+    tag = "agents",
+    summary = "Pending snapshot requests for a node (agent poll)"
+)]
 async fn snapshot_requests(
-    State(state): State<AppState>,
+    Extension(state): Extension<AppState>,
     Query(query): Query<SnapshotRequestsQuery>,
 ) -> Json<Vec<PendingSnapshot>> {
     let inner = state.inner.read().await;
     Json(state::snapshot_requests_for_node(&inner, &query.node_id))
 }
 
+#[post("/tasks/{id}/snapshots/{snapshot_id}/result")]
+#[api_doc(tag = "snapshots", summary = "Report a snapshot outcome (agent)")]
 async fn report_snapshot_result(
-    State(state): State<AppState>,
+    Extension(state): Extension<AppState>,
     Path((id, snapshot_id)): Path<(TaskId, SnapshotId)>,
     Json(req): Json<ReportSnapshotResult>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     {
         let mut inner = state.inner.write().await;
         state::report_snapshot_result(&mut inner, &id, &snapshot_id, &req).map_err(ApiError)?;
@@ -263,7 +326,9 @@ async fn report_snapshot_result(
 }
 
 /// Prometheus text-format metrics (v0.4).
-async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+#[get("/metrics")]
+#[api_doc(tag = "ops", summary = "Prometheus metrics for the control plane")]
+async fn metrics(Extension(state): Extension<AppState>) -> impl IntoResponse {
     let body = {
         let inner = state.inner.read().await;
         crate::metrics::render_metrics(&inner, Utc::now())
@@ -279,7 +344,13 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// Service discovery: every named service and its running endpoints (v0.4).
-async fn list_services(State(state): State<AppState>) -> Json<Vec<ServiceInfo>> {
+#[get("/services")]
+#[api_doc(
+    mcp,
+    tag = "services",
+    summary = "Service discovery: named services and their running endpoints"
+)]
+async fn list_services(Extension(state): Extension<AppState>) -> Json<Vec<ServiceInfo>> {
     let inner = state.inner.read().await;
     Json(state::service_endpoints(&inner))
 }
@@ -292,8 +363,14 @@ struct OverlayPeersQuery {
 /// The VXLAN mesh as seen by `node_id`: every *other* alive node that
 /// reported an underlay IP (v0.4). The agent turns these into static FDB
 /// entries on its `vxlan<vni>` device.
+#[get("/agents/overlay-peers")]
+#[api_doc(
+    mcp,
+    tag = "agents",
+    summary = "VXLAN mesh peers for a node (underlay IPs of other alive nodes)"
+)]
 async fn overlay_peers(
-    State(state): State<AppState>,
+    Extension(state): Extension<AppState>,
     Query(query): Query<OverlayPeersQuery>,
 ) -> Json<Vec<OverlayPeer>> {
     let now = Utc::now();
@@ -326,7 +403,9 @@ fn esc(input: &str) -> String {
 
 /// Server-rendered status page (v0.4): nodes, services, tasks, IPAM.
 /// Static HTML, no JavaScript.
-async fn status_page(State(state): State<AppState>) -> Html<String> {
+#[get("/")]
+#[api_doc(tag = "ops", summary = "Static HTML status page")]
+async fn status_page(Extension(state): Extension<AppState>) -> Html<String> {
     let now = Utc::now();
     // The read guard is dropped before the response is built: it is only
     // needed while the row strings are rendered.

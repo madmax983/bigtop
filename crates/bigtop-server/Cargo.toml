@@ -5,6 +5,10 @@ edition = "2021"
 description = "BigTop server: REST API, in-memory store, and scheduler"
 
 [dependencies]
+# v0.5: the control plane is served through Autumn. `autumn-web 0.7` comes
+# from crates.io (published) — a plain `git clone` of bigtop builds with no
+# local checkout of the autumn workspace required.
+autumn-web = { version = "0.7", default-features = false, features = ["mcp"] }
 axum = "0.8"
 bigtop-core = { path = "../bigtop-core" }
 chrono = "0.4"
@@ -12,6 +16,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", default-features = false }
 
 [dev-dependencies]
 criterion = "0.7"

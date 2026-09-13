@@ -2,8 +2,10 @@
 #
 # Boots an actual Firecracker microVM on a KVM-capable runner and proves
 # guest execution plus snapshot/restore. See docs/kvm-ci.md for runner
-# setup. This workflow NEVER runs on GitHub-hosted runners: ordinary
-# hosted runners have no /dev/kvm, and the preflight below fails fast
+# setup. This workflow never runs on *standard* GitHub-hosted runners
+# (no /dev/kvm there); GitHub's paid larger runners do expose KVM but
+# need a Team/Enterprise org, so they are a documented opt-in in
+# docs/kvm-ci.md rather than the default. The preflight below fails fast
 # rather than silently skipping the tests.
 
 name: kvm

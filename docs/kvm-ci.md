@@ -10,12 +10,12 @@ BigTop's CI has two tiers:
 Tier 0 never touches a hypervisor. Tier 1 is the only place the claim
 "BigTop boots real microVMs" gets verified.
 
-## Why not GitHub-hosted runners?
+## Why not (standard) GitHub-hosted runners?
 
 Firecracker's own getting-started guide requires Linux with KVM and
 read/write access to `/dev/kvm`
 ([source](https://github.com/firecracker-microvm/firecracker/blob/fea3897ccfab0387ce5cd4fa2dd49d869729d612/docs/getting-started.md)).
-Ordinary GitHub-hosted runners do not expose `/dev/kvm`
+Standard (free) GitHub-hosted runners do not expose `/dev/kvm`
 ([GitHub Next's sandbox design notes](https://github.com/githubnext/gh-aw-firewall/blob/HEAD/docs/sandbox-design.md),
 [Actuated's KVM-in-Actions write-up](https://actuated.com/blog/kvm-in-github-actions)).
 So Tier 1 is pinned to `runs-on: [self-hosted, linux, kvm]` and starts
@@ -23,6 +23,12 @@ with a **fail-fast preflight**: if `/dev/kvm` is absent or inaccessible
 the job errors immediately instead of silently skipping the tests.
 (The tests themselves also skip cleanly with a printed reason when the
 prerequisites are missing, so a dev laptop never goes red.)
+
+The exception is **GitHub's larger runners** (paid tier): they support
+nested virtualization and do expose `/dev/kvm`
+([community discussion #8305](https://github.com/orgs/community/discussions/8305),
+[changelog, 2023-02-23](https://github.blog/changelog/2023-02-23-hardware-accelerated-android-virtualization-now-available-for-github-actions-larger-linux-runners/)).
+See the honest footnotes below for why this lane doesn't use them.
 
 ## Runner options
 
@@ -65,11 +71,25 @@ Their Android-emulator docs likewise confirm KVM-backed runners on
 
 ### Honest footnotes
 
-- **GitHub's own larger runners** (paid tier) do expose KVM for
-  hardware-accelerated Android virtualization
-  ([changelog, 2023-02-23](https://github.blog/changelog/2023-02-23-hardware-accelerated-android-virtualization-now-available-for-github-actions-larger-linux-runners/)).
-  That is a verified fact, but this lane is deliberately built on the
-  self-hosted label set above, not on GitHub's paid tier.
+- **GitHub's own larger runners** (paid tier) do expose KVM: nested
+  virtualization is supported on larger Linux runners, and multiple
+  users confirm `/dev/kvm` works there
+  ([community discussion #8305](https://github.com/orgs/community/discussions/8305),
+  [changelog, 2023-02-23](https://github.blog/changelog/2023-02-23-hardware-accelerated-android-virtualization-now-available-for-github-actions-larger-linux-runners/)).
+  Two catches keep this lane off them. First, larger runners are only
+  available to **organizations and enterprises on GitHub Team or GitHub
+  Enterprise Cloud** — not personal accounts
+  ([pricing docs](https://docs.github.com/en/billing/reference/actions-runner-pricing));
+  BigTop lives on a personal account, so that door opens only if the
+  repo moves under a qualifying org. Second, they are billed per minute
+  (Linux is on the order of $0.01–0.03/min depending on size), consume
+  no free minutes, and are not free for public repos — so a nightly
+  Tier 1 on larger runners is a standing charge, not a freebie. If you
+  ever go this route, the known permission fix from the thread is a
+  udev rule granting the runner user access:
+  `echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"'`
+  `| sudo tee /etc/udev/rules.d/99-kvm4all.rules`, then reload udev and
+  add the runner user to the `kvm` group.
 - **Ubicloud**: one third-party source claims their runners lack nested
   virtualization. That is not vendor documentation, so treat Ubicloud as
   **unverified** — ask them before relying on it.

@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# BigTop v0.5 live demo: server (with persistence + bearer auth, served
-# through Autumn) + agent (process runtime) + jobs. Exercises the v0.5
-# surface: --data-dir journaling, service discovery, /metrics, the status
-# page, the bearer-token control plane, OpenAPI, and the MCP allowlist.
+# BigTop v0.6 live demo: server (with persistence + bearer auth, served
+# through Autumn, plus the Harvest snapshot shadow) + agent (process
+# runtime) + jobs. Exercises the v0.6 surface: --data-dir journaling,
+# service discovery, /metrics, the status page, the bearer-token control
+# plane, OpenAPI, the MCP allowlist, and the opt-in Harvest shadow
+# (--harvest-shadow) auditing a process-runtime snapshot to an `agree`
+# verdict.
 # Usage: demo.sh — leaves server/agent running; kill them when done.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -16,7 +19,7 @@ rm -rf "$DATA_DIR"
 export BIGTOP_API_TOKEN="demo-token-$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 AUTH=(-H "Authorization: Bearer $BIGTOP_API_TOKEN")
 
-"$BIN" server --port "$PORT" --data-dir "$DATA_DIR" > demo-server.log 2>&1 &
+"$BIN" server --port "$PORT" --data-dir "$DATA_DIR" --harvest-shadow "$DATA_DIR/shadow.db" > demo-server.log 2>&1 &
 SERVER_PID=$!
 "$BIN" agent --server "$SERVER" --name demo-node --runtime process > demo-agent.log 2>&1 &
 AGENT_PID=$!
@@ -36,11 +39,30 @@ echo '=== bigtop run examples/hello.toml ==='
 sleep 3
 echo '=== bigtop ps (should show running) ==='
 "$BIN" ps --server "$SERVER"
+TASK_ID=$(curl -s "${AUTH[@]}" "$SERVER/v1/tasks" | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['id'])")
+echo '=== shadow: snapshot the running task (process runtime fails fast) ==='
+"$BIN" snapshot create "$TASK_ID" --server "$SERVER"
+echo '=== waiting for the agent report + shadow audit (1s driver, 5s polls) ==='
+sleep 15
+echo '=== GET /v1/shadow/snapshots (expect verdict "agree") ==='
+curl -s "${AUTH[@]}" "$SERVER/v1/shadow/snapshots" | python3 -c "
+import json, sys
+tracks = json.load(sys.stdin)
+assert tracks, 'no shadow tracks recorded'
+for t in tracks:
+    print(t['snapshot_id'], '->', t['verdict'], '| observations:', len(t['observations']))
+bad = [t for t in tracks if t['verdict'] != 'agree']
+if bad:
+    print('FAIL: non-agree verdicts:', [(t['snapshot_id'], t['verdict']) for t in bad], file=sys.stderr)
+    sys.exit(1)
+print('shadow verdict: agree')
+"
+echo '=== shadow metrics ==='
+curl -s "${AUTH[@]}" "$SERVER/metrics" | grep -E "^bigtop_harvest_shadow"
 echo '=== unauthenticated request is rejected (401) ==='
 curl -s -o /dev/null -w "%{http_code}\n" "$SERVER/v1/nodes"
 echo '=== authenticated: list nodes ==='
 curl -s "${AUTH[@]}" "$SERVER/v1/nodes" | head -c 200; echo
-TASK_ID=$(curl -s "${AUTH[@]}" "$SERVER/v1/tasks" | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['id'])")
 echo "=== bigtop logs $TASK_ID ==="
 "$BIN" logs "$TASK_ID" --server "$SERVER"
 echo '=== bigtop run examples/service.toml ==='

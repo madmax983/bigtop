@@ -202,6 +202,22 @@ impl JournalWriter {
     pub const fn ops_written(&self) -> u64 {
         self.ops_written
     }
+
+    /// A writer whose appends always fail (backed by `/dev/full`).
+    /// Test-only: simulates a journal I/O failure so the failure path of
+    /// every journaled mutation can be exercised honestly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`std::io::Error`] when `/dev/full` cannot be opened.
+    #[cfg(test)]
+    pub fn failing() -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new().write(true).open("/dev/full")?;
+        Ok(Self {
+            file,
+            ops_written: 0,
+        })
+    }
 }
 
 /// Open (creating) the journal for appending.

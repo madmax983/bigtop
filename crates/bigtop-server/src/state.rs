@@ -57,6 +57,8 @@ pub struct StateInner {
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
     pub(crate) inner: Arc<RwLock<StateInner>>,
+    /// Harvest shadow handle (v0.6). `None` when the shadow is disabled.
+    pub shadow: Option<crate::harvest_shadow::ShadowHandle>,
 }
 
 impl AppState {
@@ -74,6 +76,7 @@ impl AppState {
                 ipam,
                 ..StateInner::default()
             })),
+            shadow: None,
         }
     }
 
@@ -83,6 +86,7 @@ impl AppState {
     pub fn from_inner(inner: StateInner) -> Self {
         Self {
             inner: Arc::new(RwLock::new(inner)),
+            shadow: None,
         }
     }
 }
@@ -338,6 +342,13 @@ pub fn set_task_state(
 /// The task must exist, be `Running`, and be assigned to a node; the record
 /// starts in [`SnapshotState::Requested`] for the owning agent to pick up.
 ///
+/// Request a snapshot of a running task.
+///
+/// Returns the accepted [`SnapshotRecord`] — the caller clones it out from
+/// under the write lock, releases the lock, and only then notifies the
+/// Harvest shadow (mirror update, then track). The shadow never runs
+/// inside the authoritative lock or before the journal append.
+///
 /// # Errors
 ///
 /// Returns [`Error::NotFound`] for an unknown task, or [`Error::Conflict`]
@@ -347,7 +358,7 @@ pub fn request_snapshot(
     task_id: &TaskId,
     req: &RequestSnapshotRequest,
     now: DateTime<Utc>,
-) -> Result<SnapshotId, Error> {
+) -> Result<SnapshotRecord, Error> {
     let task = inner
         .tasks
         .get(task_id)
@@ -375,9 +386,15 @@ pub fn request_snapshot(
         error: None,
         created_at: now,
     };
-    inner.snapshots.insert(id.clone(), record.clone());
-    journal_op(inner, &JournalOp::RequestSnapshot { record }).map_err(|e| journal_err(&e))?;
-    Ok(id)
+    inner.snapshots.insert(id, record.clone());
+    journal_op(
+        inner,
+        &JournalOp::RequestSnapshot {
+            record: record.clone(),
+        },
+    )
+    .map_err(|e| journal_err(&e))?;
+    Ok(record)
 }
 
 /// Snapshot requests waiting for `node_id`'s agent, oldest first.
@@ -426,6 +443,11 @@ pub fn task_snapshots(inner: &StateInner, task_id: &TaskId) -> Result<Vec<Snapsh
 /// `InProgress -> {Done, Failed}`. On `Done`, resolved file paths from the
 /// report replace the requested ones.
 ///
+/// Returns the updated [`SnapshotRecord`] — the caller clones it out from
+/// under the write lock, releases the lock, and only then updates the
+/// Harvest shadow mirror. The shadow never runs inside the authoritative
+/// lock or before the journal append.
+///
 /// # Errors
 ///
 /// Returns [`Error::NotFound`] for an unknown snapshot (or a snapshot that
@@ -437,7 +459,7 @@ pub fn report_snapshot_result(
     task_id: &TaskId,
     snapshot_id: &SnapshotId,
     result: &ReportSnapshotResult,
-) -> Result<(), Error> {
+) -> Result<SnapshotRecord, Error> {
     if matches!(result.state, SnapshotState::Requested) {
         return Err(Error::Conflict(format!(
             "snapshot {snapshot_id}: agents cannot report Requested"
@@ -477,6 +499,7 @@ pub fn report_snapshot_result(
     if let Some(path) = &result.snapshot_path {
         record.spec.snapshot_path.clone_from(path);
     }
+    let updated = record.clone();
     journal_op(
         inner,
         &JournalOp::ReportSnapshot {
@@ -486,7 +509,7 @@ pub fn report_snapshot_result(
         },
     )
     .map_err(|e| journal_err(&e))?;
-    Ok(())
+    Ok(updated)
 }
 
 /// Append log lines, keeping only the bounded tail.
@@ -673,8 +696,9 @@ mod tests {
     fn snapshot_lifecycle_requested_to_done() {
         let mut inner = StateInner::default();
         let (task_id, node) = running_task(&mut inner);
-        let snap_id =
-            request_snapshot(&mut inner, &task_id, &snapshot_req(), Utc::now()).expect("request");
+        let snap_id = request_snapshot(&mut inner, &task_id, &snapshot_req(), Utc::now())
+            .expect("request")
+            .id;
         let record = inner.snapshots.get(&snap_id).expect("record");
         assert_eq!(record.state, SnapshotState::Requested);
         assert_eq!(record.node_id, node);
@@ -717,8 +741,9 @@ mod tests {
     fn snapshot_rejects_illegal_transitions() {
         let mut inner = StateInner::default();
         let (task_id, node) = running_task(&mut inner);
-        let snap_id =
-            request_snapshot(&mut inner, &task_id, &snapshot_req(), Utc::now()).expect("request");
+        let snap_id = request_snapshot(&mut inner, &task_id, &snapshot_req(), Utc::now())
+            .expect("request")
+            .id;
 
         // Agents cannot report Requested.
         let err = report_snapshot_result(
@@ -776,8 +801,9 @@ mod tests {
     fn snapshot_failure_records_error() {
         let mut inner = StateInner::default();
         let (task_id, node) = running_task(&mut inner);
-        let snap_id =
-            request_snapshot(&mut inner, &task_id, &snapshot_req(), Utc::now()).expect("request");
+        let snap_id = request_snapshot(&mut inner, &task_id, &snapshot_req(), Utc::now())
+            .expect("request")
+            .id;
         report_snapshot_result(
             &mut inner,
             &task_id,

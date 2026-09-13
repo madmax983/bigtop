@@ -2,6 +2,7 @@
 
 mod api;
 mod auth;
+mod harvest_shadow;
 mod ipam;
 mod journal;
 mod metrics;
@@ -9,12 +10,14 @@ mod scheduler;
 mod state;
 
 pub use api::root_routes;
+pub use harvest_shadow::{spawn_shadow, ShadowHandle, ShadowStatsSnapshot};
 pub use ipam::{Ipam, IpamError};
 pub use journal::{DirLock, JournalOp, JournalWriter, StoreError};
 pub use scheduler::tick;
 pub use state::{service_endpoints, AppState, StateInner};
 
 use autumn_web::auth::RequireApiToken;
+use bigtop_core::SnapshotRecord;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -52,6 +55,9 @@ pub struct ServerConfig {
     /// Data directory for the journal and snapshots (v0.4). `None` runs
     /// purely in-memory, as in v0.3 and earlier.
     pub data_dir: Option<PathBuf>,
+    /// Path to the Harvest shadow `SQLite` file (v0.6). `None` disables the
+    /// shadow entirely: no Harvest initialization, no background work.
+    pub harvest_shadow: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -63,6 +69,7 @@ impl Default for ServerConfig {
             tick_interval: Duration::from_millis(500),
             network_cidr: "172.28.0.0/16".to_string(),
             data_dir: None,
+            harvest_shadow: None,
         }
     }
 }
@@ -186,6 +193,11 @@ impl autumn_web::telemetry::TelemetryProvider for TolerantTelemetryProvider {
 /// through Autumn. The scheduler tick, state machine, IPAM, and journal
 /// stay outside the framework's application logic.
 ///
+/// Harvest shadow (v0.6, opt-in): observe-only snapshot auditing. The
+/// mirror is seeded from the replayed journal; the driver thread polls
+/// Harvest every second. Failure here disables the shadow — the server
+/// continues without it.
+///
 /// # Errors
 ///
 /// Returns [`ServerError::Network`] when `network_cidr` does not parse as
@@ -209,6 +221,13 @@ pub async fn serve_config(config: ServerConfig) -> Result<(), ServerError> {
         .map_err(|e| ServerError::Network(format!("{}: {e}", config.network_cidr)))?;
 
     let (state, data_dir, lock) = load_persistent_state(config.data_dir.as_ref(), ipam)?;
+
+    // Harvest shadow (v0.6, opt-in): observe-only snapshot auditing.
+    // The mirror is seeded from the replayed journal above; the driver
+    // thread polls Harvest every second. Failure here disables the
+    // shadow — the server continues without it.
+    let mut state = state;
+    maybe_enable_shadow(&mut state, config.harvest_shadow.as_ref()).await;
 
     // Auth (v0.5): one bearer token gates the whole control plane. When
     // the operator did not configure one, issue it here and print it
@@ -335,6 +354,31 @@ pub async fn serve_config(config: ServerConfig) -> Result<(), ServerError> {
     Ok(())
 }
 
+/// Enable the Harvest shadow if configured.
+///
+/// The mirror is seeded from the replayed journal — after replay, before
+/// the driver thread starts — so no workflow can observe a pre-replay
+/// mirror. Failure disables the shadow; the server continues without it.
+async fn maybe_enable_shadow(state: &mut AppState, db_path: Option<&std::path::PathBuf>) {
+    let Some(db_path) = db_path else { return };
+    let seed: Vec<SnapshotRecord> = {
+        let inner = state.inner.read().await;
+        inner.snapshots.values().cloned().collect()
+    };
+    match spawn_shadow(db_path, seed) {
+        Ok(handle) => {
+            println!(
+                "bigtop server: harvest shadow enabled at {}",
+                db_path.display()
+            );
+            state.shadow = Some(handle);
+        }
+        Err(e) => {
+            eprintln!("bigtop server: harvest shadow disabled: {e}");
+        }
+    }
+}
+
 /// Bind address for Autumn's runtime, from [`ServerConfig`].
 #[derive(Debug, Clone)]
 struct ServerBind {
@@ -356,5 +400,63 @@ impl autumn_web::config::ConfigLoader for ServerBind {
             config.server.port = port;
             Ok(config)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Disabled shadow mode: with no `--harvest-shadow` path, enabling is a
+    /// no-op — no mirror, no driver thread, no Harvest initialization, no
+    /// `SQLite` file, no background work. The snapshot path behaves exactly
+    /// as v0.5.
+    #[tokio::test]
+    async fn disabled_shadow_creates_nothing() {
+        let mut state = AppState::new();
+        assert!(state.shadow.is_none());
+
+        let db_path =
+            std::env::temp_dir().join(format!("bigtop-shadow-disabled-{}", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+        assert!(!db_path.exists());
+
+        // The server startup path with `harvest_shadow: None`.
+        maybe_enable_shadow(&mut state, None).await;
+
+        assert!(
+            state.shadow.is_none(),
+            "disabled shadow must not install a handle"
+        );
+        assert!(
+            !db_path.exists(),
+            "disabled shadow must not create a SQLite file"
+        );
+    }
+
+    /// Disabled shadow mode with a configured path must still enable the
+    /// shadow (the opt-in actually opts in).
+    #[tokio::test]
+    async fn enabled_shadow_installs_handle() {
+        let mut state = AppState::new();
+        let db_path =
+            std::env::temp_dir().join(format!("bigtop-shadow-enabled-{}", std::process::id()));
+        let _ = std::fs::remove_file(&db_path);
+
+        maybe_enable_shadow(&mut state, Some(&db_path)).await;
+
+        assert!(
+            state.shadow.is_some(),
+            "configured shadow path must install a handle"
+        );
+        assert!(
+            db_path.exists(),
+            "enabled shadow must create its SQLite file"
+        );
+        let _ = std::fs::remove_file(&db_path);
+        let wal = format!("{}-wal", db_path.display());
+        let shm = format!("{}-shm", db_path.display());
+        let _ = std::fs::remove_file(&wal);
+        let _ = std::fs::remove_file(&shm);
     }
 }

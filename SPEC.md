@@ -1,4 +1,4 @@
-# BigTop v0.5 — Spec
+# BigTop v0.6 — Spec
 
 BigTop is a Firecracker-first orchestrator. Every workload is a microVM:
 the security of VMs with the speed of containers. One binary, opinionated,
@@ -541,3 +541,223 @@ bigtop [--api-token TOKEN] snapshot restore <task-id> <snapshot-id> [--server UR
 `--api-token` is global (also `BIGTOP_API_TOKEN`); the flag wins. When the
 server starts without one it generates a token and prints it once — hand
 it to every agent and CLI via the flag or the env var.
+
+---
+
+## v0.6: Harvest shadow for snapshots
+
+v0.6 is **the auditor**: Harvest (SQLite backend) watches snapshot
+orchestration in *shadow mode*. It never drives anything — no Firecracker
+calls, no state writes, no result reports. It durably observes each
+snapshot request, audits the observed transition sequence against the
+snapshot state machine, and records a verdict. The existing snapshot path
+is untouched; Harvest only reads.
+
+## Non-goals
+
+- Harvest does not enter the scheduler tick, heartbeats, IPAM, task-state
+  facts, or any write path. Snapshots only.
+- No production cutover: shadow mode has no "promote" switch in v0.6.
+- No Postgres runner, no management API, no multi-writer. Single server,
+  single SQLite file — matches BigTop's one-binary shape.
+
+## Configuration (explicit opt-in)
+
+`bigtop server --harvest-shadow PATH` (also `BIGTOP_HARVEST_SHADOW`;
+flag wins). When absent, Harvest is never initialized: no DB file is
+created, no background task runs, the snapshot path behaves exactly as
+v0.5. When present, the server opens (creating/migrating) a Harvest
+SQLite database at `PATH` and starts the shadow driver.
+
+## Shadow workflow: `snapshot_shadow`
+
+One Harvest workflow execution per snapshot request, started by the
+server *after* `JournalOp::RequestSnapshot` is durably journaled.
+
+Input: `{ snapshot_id, task_id, node_id, poll_secs = 5, max_polls = 72 }`
+(72 × 5 s = 6-minute audit deadline).
+
+Body:
+1. Activity `observe_snapshot_state(snapshot_id)` → `Observation`
+   (see below). Record it.
+2. While the last observation is non-terminal (`Requested`/`InProgress`)
+   and polls remain: `ctx.timer("shadow-poll-{n}", poll_secs)`, then
+   observe again and record.
+3. `judge(observations)` → `Verdict`; return `ShadowOutput {
+   snapshot_id, verdict, observations }` as the workflow output —
+   the complete verdict **plus** the full observation trail, persisted
+   by Harvest as the execution outcome.
+
+The workflow's Harvest history — the recorded activity results, one per
+poll — **is** the durable per-poll audit trail: timestamped, replayable,
+and resumed from history after a restart. The verdict table (below) keeps
+a queryable copy of the same trail.
+
+`judge` (pure function, unit-tested):
+- Any observation `missing` → `Missing` (the record vanished: the
+  known crash window between in-memory insert and journal append).
+- Last observation terminal (`Done`/`Failed`) and every consecutive
+  pair a legal transition (`Requested → Requested|InProgress|Done|Failed`,
+  `InProgress → InProgress|Done|Failed`) → `Agree`.
+- Otherwise (deadline exhausted while non-terminal, or an illegal pair)
+  → `Stuck`. This is the detector for the known durability holes:
+  agent crash after Firecracker wrote files, lost result reports,
+  verbatim-replayed `Requested`/`InProgress` records that never resume.
+
+Timers are Harvest durable timers: a server restart mid-audit resumes
+the workflow from its recorded history; the audit continues where it
+stopped.
+
+## Activities (inert by construction)
+
+`observe_snapshot_state(snapshot_id: String) -> Result<Observation, String>`
+
+- Synchronous closure (the SQLite backend's activity model).
+- Reads the **shadow-owned synchronous snapshot mirror**
+  (`Arc<Mutex<HashMap<SnapshotId, SnapshotRecord>>>`), *not* the
+  authoritative Tokio lock. Why: `poll_once` must run inside a Tokio
+  runtime context (Harvest's executor uses `tokio::time::timeout`), and
+  tokio's `blocking_read` panics when a runtime context is entered on
+  the calling thread. The mirror exists so the activity never touches
+  the authoritative lock at all — there is no lock ordering to get
+  wrong, and the activity can never deadlock the server.
+- The mirror is created and owned by the shadow (`spawn_shadow`), seeded
+  from the journal-replayed snapshot records **before** the driver thread
+  starts, so no workflow can observe a pre-replay mirror.
+- Mirror updates happen strictly **post-journal and post-lock**: the API
+  layer calls `ShadowHandle::mirror_snapshot(&record)` only after the
+  authoritative mutation is journaled *and* the authoritative lock is
+  released. Ordering per mutation: authoritative write → journal append
+  succeeds → clone the record → release the lock → update the mirror →
+  notify the shadow. A failed journal append never touches the mirror;
+  journal replay never touches the mirror (it is shadow-owned, not
+  state-owned).
+- Copies the `SnapshotRecord`'s `{state, error, mem_file_path,
+  snapshot_path}`. No writes, no I/O, no Firecracker, no network.
+- Returns `{state: None}` (missing) when the id is unknown — the crash
+  window between the in-memory insert and the journal append.
+- Declared with plain `#[activity]` (no attributes): no retry policy
+  (single attempt), none of the Postgres-only knobs — so the SQLite
+  backend's setup-time audit accepts it. The macro requires an async
+  signature (`ctx: &ActivityContext` first); the SQLite backend ignores
+  the generated handler and runs the registered sync body.
+
+`Observation { state, error, mem_file_path, snapshot_path, missing,
+observed_at }` is the durable per-poll record. The workflow history in
+Harvest's SQLite is the timestamped audit trail.
+
+## Verdict persistence (BigTop-owned table)
+
+Harvest's SQLite runtime has no list/query-by-workflow-id API, so the
+shadow keeps its own table **in the same SQLite file**
+(`bigtop_shadow_tracks`):
+
+```
+snapshot_id TEXT PRIMARY KEY,
+execution_id TEXT NOT NULL,
+task_id TEXT NOT NULL,
+verdict TEXT NOT NULL,          -- pending | agree | stuck | missing | harvest_error
+observations_json TEXT NOT NULL, -- Vec<Observation>; '[]' until the audit completes
+detail TEXT NOT NULL,           -- human detail for harvest_error
+updated_at TEXT NOT NULL
+```
+
+- Row inserted (`pending`, `observations_json = '[]'`) when the workflow
+  starts: this is the `SnapshotId → ExecutionId` mapping.
+- `observations_json` is written **once, at workflow completion** — when
+  the sweep moves a terminal Harvest outcome into the table. It is not
+  updated progressively; the in-flight trail lives in Harvest's workflow
+  history until then.
+- A driver thread (1 s cadence) advances Harvest (`poll_once`) and sweeps
+  `pending` rows: `Completed(v)` deserializes the `ShadowOutput` and
+  records the verdict plus the full observation trail;
+  `Failed(e)`/`Terminated(s)` → `harvest_error` with the detail.
+- The table is read with a second rusqlite connection (WAL mode, busy
+  timeout); Harvest's six tables are never touched by BigTop code.
+- On restart the driver reloads `pending` rows and resumes tracking;
+  Harvest resumes the workflows from its own tables. Completed verdicts
+  survive restarts; that is the whole point.
+
+## Wiring
+
+- New `bigtop-server` module `harvest_shadow` (newtypes for
+  `Verdict`, `Observation`; `thiserror` errors; no `unwrap` in
+  production paths).
+- `spawn_shadow(db_path: &Path, seed: Vec<SnapshotRecord>)`:
+  `SqliteRuntime::open`, `register_workflow` / `register_activity`
+  (plain macros only), create the verdict table, seed the shadow-owned
+  mirror from `seed` (the journal-replayed records), spawn the driver
+  thread. The driver enters a Tokio `Handle` context around each
+  `poll_once` via `Handle::block_on` (from its own thread, outside the
+  runtime). `Err` (bad path, locked DB, no runtime context) means "run
+  without the shadow" — the caller logs and continues.
+- API handler for `POST /v1/tasks/{id}/snapshot`, after
+  `request_snapshot` returns `Ok(record)`: `shadow.mirror_snapshot(
+  &record)` (post-lock mirror update), then
+  `shadow.notify_requested(id, task_id, node_id)` — infallible,
+  logs-and-counts on error. Same post-lock mirror update in the
+  `POST .../result` handler after `report_snapshot_result` succeeds.
+- **Failure containment**: every Harvest call site maps errors to
+  `eprintln!` + `bigtop_harvest_shadow_errors_total`. A Harvest failure
+  (bad path, locked DB, poisoned registration) can never fail, delay,
+  or alter a snapshot request, report, or restore. If `spawn_shadow`
+  fails, the server logs and continues with the shadow disabled.
+
+## Read surface
+
+- `GET /v1/shadow/snapshots` → `[{snapshot_id, task_id, verdict,
+  observations, detail, updated_at}]` newest first (behind the same bearer
+  auth as all `/v1` routes; `404` when the shadow is disabled).
+- MCP tool `shadow_verdicts` (read-only): same payload.
+- Metrics:
+  - `bigtop_harvest_shadow_workflows_started_total` — snapshot audits started
+  - `bigtop_harvest_shadow_verdict_total{verdict}` — tracked snapshots by
+    current verdict (`pending` | `agree` | `stuck` | `missing` |
+    `harvest_error`)
+  - `bigtop_harvest_shadow_observations_total` — observations recorded
+  - `bigtop_harvest_shadow_errors_total` — contained shadow failures
+
+## Tests (before/alongside)
+
+- `judge` unit tests: agree path, stuck-on-deadline, missing record,
+  illegal pair (`InProgress → Requested`).
+- Deterministic workflow test (`poll_once_as_of`, no sleeps):
+  `Requested → InProgress → Done` ⇒ `agree`, and the durable trail is
+  exactly the three-state sequence — no skipped observations.
+- Divergence test: record deleted mid-audit ⇒ `missing`; record frozen
+  in `Requested` with tiny deadline ⇒ `stuck`.
+- Ordering test: a failed journal append never touches the shadow
+  mirror; the mirror updates only after journal success and lock
+  release.
+- Disabled-mode test: without `--harvest-shadow`, no mirror, no driver
+  thread, no Harvest initialization, no SQLite file, no background
+  work — the snapshot path behaves exactly as v0.5.
+- Restart test: start workflow, drop runtime, reopen, drive to idle ⇒
+  verdict still recorded (durable timers + history replay).
+- Containment test: `spawn_shadow` on an unwritable path fails; the
+  snapshot request path still succeeds (shadow disabled fallback).
+- Server integration: shadow enabled, process-runtime agent snapshot
+  (fails fast) ⇒ `agree` verdict visible via `GET /v1/shadow/snapshots`.
+
+## Demo
+
+`demo.sh` gains a shadow step: start the server with
+`--harvest-shadow`, run a process-runtime snapshot (→ `Failed`), then
+show the `agree` verdict from `/v1/shadow/snapshots` and the new
+metrics.
+
+## Honest gaps (carried from v0.5, still true)
+
+No `/dev/kvm` here, so a real Firecracker snapshot (`Done` with real
+files) is unverified in this sandbox; the shadow's `agree` path for
+`Done` is exercised with synthetic records. Real multi-minute stuck
+detection is covered by unit tests with short deadlines, not by a live
+6-minute wait.
+
+## Dependencies
+
+`bigtop-server` gains `autumn-harvest-sqlite 0.6.0`,
+`autumn-harvest-macros 0.6.0`, `autumn-harvest 0.6.0
+(default-features = false)`, and `rusqlite 0.40` (verdict table).
+Autumn's workspace version is untouched. Harvest never leaves the
+snapshot shadow: no scheduler/heartbeat/IPAM/task-state integration.

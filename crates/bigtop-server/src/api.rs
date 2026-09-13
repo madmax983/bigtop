@@ -63,10 +63,12 @@ pub fn autumn_routes() -> Vec<Route> {
         request_snapshot,
         list_snapshots,
         report_snapshot_result,
+        shadow_verdicts,
     ]
 }
 
 /// Maps [`Error`] to an HTTP status plus a JSON error body.
+#[derive(Debug)]
 struct ApiError(Error);
 
 impl IntoResponse for ApiError {
@@ -269,13 +271,26 @@ async fn request_snapshot(
     Path(id): Path<TaskId>,
     Json(req): Json<RequestSnapshotRequest>,
 ) -> Result<(StatusCode, Json<RequestSnapshotResponse>), ApiError> {
-    let snapshot_id = {
+    let record = {
         let mut inner = state.inner.write().await;
         state::request_snapshot(&mut inner, &id, &req, Utc::now()).map_err(ApiError)?
     };
+    // Shadow hook (v0.6): only after the authoritative mutation, journal
+    // append, and lock release. Best-effort and infallible — never fails
+    // the request. The record carries the real node id; no second lookup.
+    if let Some(shadow) = &state.shadow {
+        shadow.mirror_snapshot(&record);
+        shadow.notify_requested(
+            record.id.clone(),
+            record.task_id.clone(),
+            record.node_id.clone(),
+        );
+    }
     Ok((
         StatusCode::ACCEPTED,
-        Json(RequestSnapshotResponse { snapshot_id }),
+        Json(RequestSnapshotResponse {
+            snapshot_id: record.id,
+        }),
     ))
 }
 
@@ -318,29 +333,110 @@ async fn report_snapshot_result(
     Path((id, snapshot_id)): Path<(TaskId, SnapshotId)>,
     Json(req): Json<ReportSnapshotResult>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    {
+    let record = {
         let mut inner = state.inner.write().await;
-        state::report_snapshot_result(&mut inner, &id, &snapshot_id, &req).map_err(ApiError)?;
+        state::report_snapshot_result(&mut inner, &id, &snapshot_id, &req).map_err(ApiError)?
+    };
+    // Shadow hook (v0.6): mirror the outcome after the authoritative
+    // mutation, journal append, and lock release. Best-effort and
+    // infallible — never fails the report.
+    if let Some(shadow) = &state.shadow {
+        shadow.mirror_snapshot(&record);
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+/// Harvest shadow verdicts (v0.6, opt-in). Read-only: every tracked
+/// snapshot, newest first. 404 when the shadow is disabled.
+#[get("/shadow/snapshots")]
+#[api_doc(
+    mcp,
+    tag = "shadow",
+    summary = "Harvest shadow verdicts for tracked snapshots (read-only)"
+)]
+async fn shadow_verdicts(
+    Extension(state): Extension<AppState>,
+) -> Result<Json<Vec<crate::harvest_shadow::ShadowTrack>>, ApiError> {
+    let shadow = state
+        .shadow
+        .as_ref()
+        .ok_or_else(|| ApiError(Error::NotFound("harvest shadow is not enabled".to_string())))?;
+    shadow
+        .tracks()
+        .map(Json)
+        .map_err(|e| ApiError(Error::Persistence(format!("shadow store: {e}"))))
 }
 
 /// Prometheus text-format metrics (v0.4).
 #[get("/metrics")]
 #[api_doc(tag = "ops", summary = "Prometheus metrics for the control plane")]
 async fn metrics(Extension(state): Extension<AppState>) -> impl IntoResponse {
-    let body = {
+    let mut out = {
         let inner = state.inner.read().await;
         crate::metrics::render_metrics(&inner, Utc::now())
     };
+    // Harvest shadow metrics (v0.6): only when the shadow is enabled.
+    // The state lock is dropped before this — shadow stats are independent.
+    if let Some(shadow) = &state.shadow {
+        render_shadow_metrics(shadow, &mut out);
+    }
     (
         StatusCode::OK,
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
-        body,
+        out,
     )
+}
+
+/// Append the four Harvest-shadow metric families (SPEC v0.6): audits
+/// started, observations recorded, contained shadow failures, and the
+/// per-verdict gauge. A verdict-store failure only costs the gauge —
+/// the counters above are lock-free.
+fn render_shadow_metrics(shadow: &crate::harvest_shadow::ShadowHandle, out: &mut String) {
+    use std::fmt::Write as _;
+    let shadow_stats = shadow.stats();
+    out.push_str("# HELP bigtop_harvest_shadow_workflows_started_total Snapshot audits started by the Harvest shadow.\n");
+    out.push_str("# TYPE bigtop_harvest_shadow_workflows_started_total counter\n");
+    let _ = writeln!(
+        out,
+        "bigtop_harvest_shadow_workflows_started_total {}",
+        shadow_stats.started
+    );
+    out.push_str("# HELP bigtop_harvest_shadow_observations_total Observations recorded by the Harvest shadow.\n");
+    out.push_str("# TYPE bigtop_harvest_shadow_observations_total counter\n");
+    let _ = writeln!(
+        out,
+        "bigtop_harvest_shadow_observations_total {}",
+        shadow_stats.observations
+    );
+    out.push_str("# HELP bigtop_harvest_shadow_errors_total Contained Harvest shadow failures.\n");
+    out.push_str("# TYPE bigtop_harvest_shadow_errors_total counter\n");
+    let _ = writeln!(
+        out,
+        "bigtop_harvest_shadow_errors_total {}",
+        shadow_stats.errors
+    );
+    // Per-verdict breakdown (v0.6).
+    if let Ok(verdicts) = shadow.metrics_snapshot() {
+        out.push_str(
+            "# HELP bigtop_harvest_shadow_verdict_total Tracked snapshots by current shadow verdict.\n",
+        );
+        out.push_str("# TYPE bigtop_harvest_shadow_verdict_total gauge\n");
+        for (verdict, count) in [
+            ("pending", verdicts.pending),
+            ("agree", verdicts.agree),
+            ("stuck", verdicts.stuck),
+            ("missing", verdicts.missing),
+            ("harvest_error", verdicts.harvest_error),
+        ] {
+            let _ = writeln!(
+                out,
+                "bigtop_harvest_shadow_verdict_total{{verdict=\"{verdict}\"}} {count}"
+            );
+        }
+    }
 }
 
 /// Service discovery: every named service and its running endpoints (v0.4).
@@ -527,4 +623,142 @@ fn render_service_rows(inner: &StateInner) -> String {
         rows.push_str("<tr><td colspan=\"2\">no services registered</td></tr>\n");
     }
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::journal::JournalWriter;
+    use bigtop_core::{
+        JobId, NetworkSpec, Resources, ServiceSpec, SnapshotPolicy, SnapshotType, TaskSpec, VmSpec,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    /// A `StateInner` holding one `Running` task on a node.
+    fn running_task_inner() -> (StateInner, TaskId) {
+        let mut inner = StateInner::default();
+        let task_id = TaskId::generate();
+        inner.tasks.insert(
+            task_id.clone(),
+            Task {
+                id: task_id.clone(),
+                job_id: JobId::generate(),
+                name: "t".to_string(),
+                spec: TaskSpec {
+                    name: "t".to_string(),
+                    command: "sh".to_string(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                    resources: Resources::default(),
+                    count: 1,
+                    vm: VmSpec {
+                        kernel_image: String::new(),
+                        rootfs: String::new(),
+                        vcpu_count: 1,
+                        mem_mb: 128,
+                        boot_args: None,
+                        boot_snapshot: None,
+                    },
+                    node_affinity: None,
+                    snapshot_policy: SnapshotPolicy::None,
+                    network: NetworkSpec {
+                        enabled: false,
+                        hostname: None,
+                    },
+                    service: ServiceSpec {
+                        name: None,
+                        discover: Vec::new(),
+                    },
+                },
+                state: TaskState::Running,
+                assigned_node: Some(NodeId::generate()),
+                exit_code: None,
+                network: None,
+            },
+        );
+        (inner, task_id)
+    }
+
+    fn shadow_db_path(tag: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("bigtop-shadow-api-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn snapshot_req() -> RequestSnapshotRequest {
+        RequestSnapshotRequest {
+            snapshot_type: SnapshotType::Full,
+            mem_file_path: None,
+            snapshot_path: None,
+        }
+    }
+
+    /// A failed journal append must fail the request *and* leave the
+    /// shadow mirror untouched: the handler mirrors only after
+    /// `state::request_snapshot` returns `Ok`.
+    #[tokio::test]
+    async fn failed_journal_append_never_touches_shadow_mirror() {
+        let db_path = shadow_db_path("ordering-fail");
+        let handle = crate::harvest_shadow::spawn_shadow(&db_path, Vec::new())
+            .expect("test shadow must spawn");
+        assert_eq!(handle.mirror_len(), 0);
+
+        // Every journal append fails (/dev/full): the authoritative write
+        // cannot be journaled.
+        let (mut inner, task_id) = running_task_inner();
+        inner.journal = Some(JournalWriter::failing().expect("failing journal"));
+        let state = AppState {
+            inner: Arc::new(RwLock::new(inner)),
+            shadow: Some(handle),
+        };
+
+        let result = request_snapshot(
+            Extension(state.clone()),
+            Path(task_id),
+            Json(snapshot_req()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a journal failure must fail the snapshot request"
+        );
+
+        let shadow = state.shadow.as_ref().expect("shadow is enabled");
+        assert_eq!(
+            shadow.mirror_len(),
+            0,
+            "a failed journal append must not touch the shadow mirror"
+        );
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// Happy path: journal append succeeds, so the record lands in the
+    /// shadow mirror exactly once.
+    #[tokio::test]
+    async fn successful_request_mirrors_record_once() {
+        let db_path = shadow_db_path("ordering-ok");
+        let handle = crate::harvest_shadow::spawn_shadow(&db_path, Vec::new())
+            .expect("test shadow must spawn");
+        let (inner, task_id) = running_task_inner();
+        // No journal (in-memory mode): the request succeeds.
+        let state = AppState {
+            inner: Arc::new(RwLock::new(inner)),
+            shadow: Some(handle),
+        };
+
+        let result = request_snapshot(
+            Extension(state.clone()),
+            Path(task_id),
+            Json(snapshot_req()),
+        )
+        .await;
+        assert!(result.is_ok(), "request must succeed: {result:?}");
+
+        let shadow = state.shadow.as_ref().expect("shadow is enabled");
+        assert_eq!(shadow.mirror_len(), 1);
+        let _ = std::fs::remove_file(&db_path);
+    }
 }

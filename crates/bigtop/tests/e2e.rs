@@ -74,6 +74,7 @@ async fn two_task_job_runs_to_succeeded() {
             api_token: Some("e2e-test-token".to_string()),
             network_cidr: "172.28.0.0/16".to_string(),
             data_dir: None,
+            harvest_shadow: None,
         }));
     let mut agent_config = AgentConfig::new(server_url.clone(), "e2e-agent".to_string());
     agent_config.heartbeat_interval = Duration::from_millis(200);
@@ -196,6 +197,7 @@ async fn spawn_authed_server(
             tick_interval: Duration::from_millis(500),
             network_cidr: "172.28.0.0/16".to_string(),
             data_dir: None,
+            harvest_shadow: None,
         }));
     let authed = reqwest::Client::builder()
         .default_headers({
@@ -514,6 +516,7 @@ async fn mcp_exposes_only_the_allowlist() {
         "list_snapshots",
         "list_tasks",
         "overlay_peers",
+        "shadow_verdicts",
         "snapshot_requests",
         "submit_job",
     ];

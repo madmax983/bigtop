@@ -87,6 +87,12 @@ enum Commands {
         /// crash-safe persistence; in-memory when omitted).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Path to the Harvest shadow `SQLite` file (enables opt-in
+        /// snapshot-orchestration shadow mode; disabled when omitted).
+        /// The `BIGTOP_HARVEST_SHADOW` environment variable provides a
+        /// fallback; the flag wins when both are set.
+        #[arg(long, env = "BIGTOP_HARVEST_SHADOW")]
+        harvest_shadow: Option<PathBuf>,
     },
     /// Run the `BigTop` agent.
     Agent {
@@ -247,7 +253,18 @@ async fn main() -> Result<()> {
             bind,
             network_cidr,
             data_dir,
-        } => cmd_server(&bind, port, &network_cidr, data_dir, api_token).await,
+            harvest_shadow,
+        } => {
+            cmd_server(
+                &bind,
+                port,
+                &network_cidr,
+                data_dir,
+                harvest_shadow,
+                api_token,
+            )
+            .await
+        }
         Commands::Agent {
             server,
             name,
@@ -320,11 +337,15 @@ async fn cmd_server(
     port: u16,
     network_cidr: &str,
     data_dir: Option<PathBuf>,
+    harvest_shadow: Option<PathBuf>,
     api_token: Option<String>,
 ) -> Result<()> {
     println!("bigtop server: listening on {bind}:{port} (loud and proud)");
     if let Some(dir) = &data_dir {
         println!("bigtop server: persisting to {}", dir.display());
+    }
+    if let Some(path) = &harvest_shadow {
+        println!("bigtop server: harvest shadow at {}", path.display());
     }
     let config = ServerConfig {
         bind_host: bind.to_string(),
@@ -333,6 +354,7 @@ async fn cmd_server(
         tick_interval: std::time::Duration::from_millis(500),
         network_cidr: network_cidr.to_string(),
         data_dir,
+        harvest_shadow,
     };
     serve_config(config).await?;
     Ok(())

@@ -9,6 +9,15 @@ description = "BigTop server: REST API, in-memory store, and scheduler"
 # from crates.io (published) — a plain `git clone` of bigtop builds with no
 # local checkout of the autumn workspace required.
 autumn-web = { version = "0.7", default-features = false, features = ["mcp"] }
+# v0.6: Harvest shadow for snapshot orchestration (SQLite backend, opt-in).
+# `autumn-harvest` with default-features = false pulls only the determinism
+# core (no Diesel/Postgres); the macros generate the WorkflowInfo/ActivityInfo
+# companions; `rusqlite` is BigTop's own connection for the verdict table
+# (the sqlite backend's connection is not exposed).
+autumn-harvest = { version = "0.6.0", default-features = false }
+autumn-harvest-macros = "0.6.0"
+autumn-harvest-sqlite = "0.6.0"
+rusqlite = { version = "0.40", features = ["bundled"] }
 axum = "0.8"
 bigtop-core = { path = "../bigtop-core" }
 chrono = "0.4"

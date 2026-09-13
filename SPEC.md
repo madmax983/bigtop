@@ -761,3 +761,98 @@ detection is covered by unit tests with short deadlines, not by a live
 (default-features = false)`, and `rusqlite 0.40` (verdict table).
 Autumn's workspace version is untouched. Harvest never leaves the
 snapshot shadow: no scheduler/heartbeat/IPAM/task-state integration.
+
+## v0.7: Verified Firecracker (KVM CI lane)
+
+**Question:** can we verify real Firecracker boot in CI? **Answer:** yes —
+on KVM-capable runners. Ordinary GitHub-hosted runners have no
+`/dev/kvm`, so verification splits into two tiers.
+
+### Two-tier CI
+
+- **Tier 0 (hosted):** `.github/workflows/ci.yml`, unchanged. fmt,
+  strict clippy, all unit and process-runtime e2e tests. No hypervisor.
+- **Tier 1 (KVM):** `.github/workflows/kvm.yml`,
+  `runs-on: [self-hosted, linux, kvm]`. Boots a real Firecracker
+  microVM, asserts guest output, snapshots the live VM, kills it,
+  restores from the snapshot, and asserts execution resumes.
+
+Shipping Tier 1 proves the *repository is ready* for real verification;
+the claim "BigTop boots real microVMs" becomes true only when the lane
+runs green on a KVM-capable runner.
+
+### Fail-fast preflight
+
+The workflow's first step checks `/dev/kvm` exists and is
+readable/writable, and that `curl`, `mke2fs`, `sha256sum` are present.
+Any failure errors the job immediately — a mislabeled runner must never
+silently skip. The tests themselves (`crates/bigtop-agent/tests/kvm_boot.rs`)
+additionally gate on `/dev/kvm` readability/writability and on
+`BIGTOP_KVM_KERNEL` / `BIGTOP_KVM_ROOTFS`, skipping cleanly with a
+printed reason when prerequisites are absent (dev laptops, this
+sandbox).
+
+### Guest contract
+
+The agent boots the guest with `bigtop.task=<id>` and
+`bigtop.cmd_b64=<base64>` on the kernel cmdline. The guest's
+`/sbin/init` (`scripts/kvm/guest-init.sh`) mounts proc/sys/dev, extracts
+`bigtop.cmd_b64`, decodes it, and runs it under BusyBox `sh` with
+stdout on the serial console (`console=ttyS0`), which Firecracker relays
+to the host. After the command exits the init idles so a live VM can be
+snapshotted.
+
+### Reproducible guest provisioning
+
+No guest binaries are committed. The workflow downloads:
+
+- Firecracker `v1.17.0` (`firecracker-v1.17.0-x86_64.tgz`), SHA-256
+  verified against `06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558`;
+- the official Firecracker quickstart kernel
+  (`.../quickstart_guide/x86_64/kernels/vmlinux.bin`), SHA-256 verified
+  against `264c461809cec3961b162d241b66a4b004f194fbaa44b1570f3f61c316d8ea69`;
+- a minimal ext4 rootfs built by `scripts/kvm/build-rootfs.sh` from a
+  pinned static BusyBox 1.35.0 (`6e123e7f32...ba311348`) plus
+  `guest-init.sh` as `/sbin/init`, assembled with `mke2fs -d`
+  (no root required).
+
+Hashes were measured 2026-09-13 from the official sources; re-pin per
+`docs/kvm-ci.md` if upstream artifacts change.
+
+### Tests (`crates/bigtop-agent/tests/kvm_boot.rs`)
+
+- `kvm_boot_runs_guest_command`: spawn via `FirecrackerRuntime::spawn`,
+  assert the guest's `echo` marker appears on the serial console.
+- `kvm_snapshot_restore_resumes_execution`: boot a heartbeat loop
+  (`BIGTOP_KVM_BOOT_MARKER` once, `BIGTOP_KVM_BEAT_n` every 2s), wait
+  for one boot marker + two beats, `take_snapshot` (full) the live VM,
+  assert both snapshot files exist and are non-empty, `kill` + `wait`
+  the original (the rootfs attaches read-write, so the restore must not
+  race it), restore under a new task id via `VmSpec.boot_snapshot`
+  (`BootKind::Snapshot`), then assert heartbeat lines continue while
+  the boot marker never reappears.
+
+### Runner options (documented in `docs/kvm-ci.md`)
+
+Self-hosted bare metal or nested-virt VM; ephemeral cloud VM with
+nested virtualization (GCP N2 `--enable-nested-virtualization`,
+verified in Google's docs); Namespace's KVM-capable runners
+(`nested_virtualization` exposes `/dev/kvm`, changelog explicitly
+names running Firecracker in CI). GitHub's larger runners also expose
+KVM (paid tier) but the lane targets the self-hosted label set.
+Ubicloud is unverified — not claimed.
+
+### Triggers
+
+`workflow_dispatch`, nightly schedule, and PRs touching
+`crates/bigtop-agent/**`, `crates/bigtop-core/**`, `scripts/kvm/**`,
+the workflow itself, or the docs.
+
+## Honest gaps (v0.7)
+
+Tier 1 has never run: no KVM-capable runner is registered yet, and this
+sandbox has no `/dev/kvm` (the tests skip cleanly here, which is
+verified below). The pinned artifact hashes are only as fresh as their
+measurement date. The guest is a minimal BusyBox init, not a
+production image — it proves the boot/snapshot machinery, not guest
+workload behavior.

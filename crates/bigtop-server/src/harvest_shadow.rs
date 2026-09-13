@@ -1098,7 +1098,10 @@ mod tests {
 
     /// Drive the shadow to quiescence at one instant: a timer firing and
     /// its activity finalizing can span two polls, so settle until idle.
-    async fn settle_as_of(driver: &mut ShadowDriver, now: DateTime<Utc>) -> Result<(), ShadowError> {
+    async fn settle_as_of(
+        driver: &mut ShadowDriver,
+        now: DateTime<Utc>,
+    ) -> Result<(), ShadowError> {
         for _ in 0..10 {
             if !driver.tick_as_of(now).await? {
                 break;
